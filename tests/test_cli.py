@@ -103,5 +103,61 @@ class CliRunTest(unittest.TestCase):
         self.assertIn("--attempt must be >= 1", proc.stderr)
 
 
+class CliMarlParserTest(unittest.TestCase):
+    def test_marl_arguments_parse(self):
+        from arena.cli import build_parser
+
+        args = build_parser().parse_args([
+            "marl", "--episodes", "9", "--attempts", "2", "--alpha", "0.4",
+            "--gamma", "0.8", "--epsilon", "0.3", "--seed", "42",
+            "--state", "marl_state.json", "--log", "trajectories/marl.jsonl",
+        ])
+        self.assertEqual(args.command, "marl")
+        self.assertEqual(args.episodes, 9)
+        self.assertEqual(args.attempts, 2)
+        self.assertEqual(args.alpha, 0.4)
+        self.assertEqual(args.gamma, 0.8)
+        self.assertEqual(args.epsilon, 0.3)
+        self.assertEqual(args.seed, 42)
+        self.assertEqual(str(args.state), "marl_state.json")
+        self.assertEqual(str(args.log), "trajectories/marl.jsonl")
+
+    def test_marl_defaults(self):
+        from arena.cli import build_parser
+
+        args = build_parser().parse_args(["marl"])
+        self.assertEqual(args.episodes, 9)
+        self.assertEqual(args.attempts, 2)
+        self.assertEqual(args.seed, 42)
+
+    def test_marl_cli_prints_summary_and_writes_report_without_model(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        from arena.cli import main
+        from test_marl import fake_generate
+
+        with tempfile.TemporaryDirectory() as td:
+            state = f"{td}/state.json"
+            log = f"{td}/episodes.jsonl"
+            report = f"{td}/report.md"
+            output = StringIO()
+            with patch("arena.solver_llm.load_model", return_value=(None, None)), \
+                 patch("arena.solver_llm.llm_generate",
+                       side_effect=lambda model, tokenizer, messages: fake_generate(messages)), \
+                 redirect_stdout(output):
+                code = main(["marl", "--episodes", "2", "--attempts", "1",
+                             "--state", state, "--log", log, "--report", report])
+            self.assertEqual(code, 0)
+            self.assertIn("MARL RUN COMPLETE", output.getvalue())
+            self.assertIn("Task selection:", output.getvalue())
+            self.assertNotIn("Q_challenger:", output.getvalue())
+            with open(report, encoding="utf-8") as f:
+                body = f.read()
+            self.assertIn("Episodes this run: 2", body)
+            self.assertIn("Final learned policy by state", body)
+            self.assertIn(log, body)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -73,6 +73,9 @@ Reward
   `python -m arena solve` (LLM retry loop).
 - **Solver retry loop** (`arena/solver.py`): model-agnostic; returns
   compiler/test feedback to the model and retries up to a configurable cap.
+- **Tabular MARL prototype** (`arena/marl.py`): independent Q tables select one
+  of three existing tasks and one of three prompt strategies. The SmolLM2
+  model stays frozen. Episode JSONL, Q state, and a Markdown run report are saved.
 - **Hugging Face SmolLM2-360M-Instruct integration** (`arena/solver_llm.py`,
   optional dependency): CPU-inference adapter, chat-template based, hidden
   tests never shown to the model.
@@ -83,9 +86,9 @@ Reward
 
 Explicitly **not** implemented — these are future work, not current behaviour:
 
-- Challenger agent / adversarial task generation;
+- Challenger task generation (the current policy only selects existing tasks);
 - LoRA, PPO, GRPO, or any reinforcement-learning weight updates;
-- MARL policy optimization (Solver/Challenger co-training);
+- SmolLM2 policy optimization or Solver/Challenger model co-training;
 - learned curriculum.
 
 No model weights have been updated; the model runs in inference mode only.
@@ -158,6 +161,21 @@ tests -> feedback -> retry -> reward -> trajectory JSONL. On first run the
 model downloads roughly 700 MB (about 7 minutes); later loads are cached
 (about 30-60 s). If model loading fails tomorrow, the deterministic demo above
 still demonstrates everything except the LLM step.
+
+### MARL policy selection (optional; invokes SmolLM2)
+
+```bash
+.venv/bin/python -m arena marl --episodes 9 --attempts 2
+```
+
+The command prints one progress line per episode and a run summary. It writes
+`marl_state.json`, `trajectories/marl.jsonl`, and
+`trajectories/marl-report.md` by default. Reusing the same state path resumes
+with global episode numbers and the saved policy RNG state; use the same seed
+and hyperparameters. `--state`, `--log`, and `--report` set artifact paths.
+The Markdown report covers the episodes in the current invocation, while the
+state and JSONL log continue across invocations. This selects tasks and prompts;
+it does not train SmolLM2 weights or establish general improvement.
 
 ## Task format
 
@@ -239,13 +257,13 @@ deterministic judging step is negligible in comparison.
 - CPU-only, fp32 inference (no quantization).
 - Stochastic generation (light sampling), so results vary between runs.
 - Small, fixed sample-task set (3 tasks).
-- No weight updates, fine-tuning, or RL/MARL training of any kind.
+- No model weight updates or fine-tuning; only task/prompt Q tables update.
 - TCC is the only supported C compiler.
 - Current tests/rewards are task-specific deterministic evaluation, not a
   general-purpose verifier.
-- No adversarial Challenger agent yet.
+- No task-generating Challenger agent yet; the policy selects fixed tasks.
 
-## Future MARL design (conceptual, not implemented)
+## Future task-generating MARL design (conceptual, not implemented)
 
 ```
   Challenger --> task --> Solver

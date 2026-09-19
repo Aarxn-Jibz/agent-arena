@@ -2,6 +2,9 @@
 
 Usage:
     python -m arena run <task.json> <solution.c> [--log PATH] [--attempt N] [--json]
+    python -m arena solve <task.json> [--attempts N] [--log PATH] [--model ID]
+    python -m arena marl [--episodes N] [--attempts N] [--alpha A] [--gamma G]
+                         [--epsilon E] [--seed S] [--state PATH] [--log PATH]
 
 Exit code is 0 when the solution passes every test, 1 otherwise (so retry
 loops in scripts can stop on the first success).
@@ -54,6 +57,46 @@ def build_parser() -> argparse.ArgumentParser:
         "--model", default=None,
         help="HuggingFace model id (default: HuggingFaceTB/SmolLM2-360M-Instruct).",
     )
+    marl = sub.add_parser(
+        "marl",
+        help="Run adversarial MARL episodes (Challenger + Solver Q-learning).",
+    )
+    marl.add_argument(
+        "--episodes", type=int, default=9,
+        help="Number of MARL episodes (default: 9).",
+    )
+    marl.add_argument(
+        "--attempts", type=int, default=2,
+        help="Maximum Solver attempts per episode (default: 2).",
+    )
+    marl.add_argument(
+        "--alpha", type=float, default=0.4,
+        help="Q-learning learning rate (default: 0.4).",
+    )
+    marl.add_argument(
+        "--gamma", type=float, default=0.8,
+        help="Q-learning discount factor (default: 0.8).",
+    )
+    marl.add_argument(
+        "--epsilon", type=float, default=0.3,
+        help="Epsilon-greedy exploration rate (default: 0.3).",
+    )
+    marl.add_argument(
+        "--seed", type=int, default=42,
+        help="Seeded RNG for epsilon-greedy policies (default: 42).",
+    )
+    marl.add_argument(
+        "--state", type=Path, default=Path("marl_state.json"),
+        help="Q-table/state persistence file (default: marl_state.json).",
+    )
+    marl.add_argument(
+        "--log", type=Path, default=Path("trajectories/marl.jsonl"),
+        help="Episode JSONL log (default: trajectories/marl.jsonl).",
+    )
+    marl.add_argument(
+        "--report", type=Path, default=Path("trajectories/marl-report.md"),
+        help="Human-readable run report (default: trajectories/marl-report.md).",
+    )
     return parser
 
 
@@ -61,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "solve":
         return _cmd_solve(args)
+    if args.command == "marl":
+        return _cmd_marl(args)
     if args.attempt < 1:
         print("error: --attempt must be >= 1", file=sys.stderr)
         return 2
@@ -115,6 +160,70 @@ def _cmd_solve(args) -> int:
     if result.log_path:
         print(f"log:      {result.log_path}")
     return 0 if result.success else 1
+
+
+def _cmd_marl(args) -> int:
+    from .marl import STATES, STRATEGIES, TASK_IDS, format_report, run_episodes, summarize_run
+    from .solver_llm import llm_generate, load_model
+
+    # The Challenger action space is the existing sample-task set.
+    task_paths = sorted(Path("tasks").glob("*.json"))
+    tasks = {load_task(p)["id"]: load_task(p) for p in task_paths}
+    if not tasks:
+        print("error: no tasks found under tasks/", file=sys.stderr)
+        return 2
+
+    # Load the frozen model ONCE, before the episode loop.
+    print("loading model (once)...")
+    model, tokenizer = load_model()
+
+    def generate(messages):
+        return llm_generate(model, tokenizer, messages)
+
+    def print_episode(record):
+        passed, total = record["best_tests"]
+        print(f"Episode {record['episode']} | task {record['challenger_action']} | "
+              f"prompt {record['solver_action']} | tests {passed}/{total} | "
+              f"best reward {max(record['arena_rewards']):.2f} | "
+              f"Challenger {record['challenger_reward']:.3f} | "
+              f"Solver {record['solver_reward']:.3f} | state {record['next_state']}")
+
+    records, state = run_episodes(
+        tasks, generate,
+        episodes=args.episodes,
+        attempts=args.attempts,
+        alpha=args.alpha,
+        gamma=args.gamma,
+        epsilon=args.epsilon,
+        seed=args.seed,
+        state_path=args.state,
+        log_path=args.log,
+        on_episode=print_episode,
+    )
+
+    summary = summarize_run(records, state)
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    args.report.write_text(format_report(summary, state, args.attempts, args.state,
+                                         args.log, args.report),
+                           encoding="utf-8")
+    print("\nMARL RUN COMPLETE")
+    print(f"Episodes: {summary['episodes']} ({summary['start_episode']}–{summary['end_episode']})")
+    print(f"Tasks attempted: {sum(summary['tasks'].values())}")
+    print(f"Average tests passed: {summary['average_tests_passed']:.1%}")
+    print(f"Average Solver reward: {summary['average_solver_reward']:.3f}")
+    print(f"Average Challenger reward: {summary['average_challenger_reward']:.3f}")
+    print("Task selection:")
+    for action in TASK_IDS:
+        print(f"  {action}: {summary['tasks'][action]}")
+    print("Prompt selection:")
+    for action in STRATEGIES:
+        print(f"  {action}: {summary['prompts'][action]}")
+    print("Final Q-policy:")
+    for s in STATES:
+        print(f"  state {s}: task {summary['policy'][s]['task']}, "
+              f"prompt {summary['policy'][s]['prompt']}")
+    print(f"Report: {args.report}")
+    return 0
 
 
 def summary(task: dict, result) -> str:
