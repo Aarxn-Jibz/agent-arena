@@ -20,6 +20,8 @@ def load_task(source: str | os.PathLike | dict) -> dict:
     else:
         with open(Path(source), encoding="utf-8") as f:
             task = json.load(f)
+    if not isinstance(task, dict):
+        raise ValueError("task must be a JSON object")
     missing = [k for k in REQUIRED_TASK_FIELDS if k not in task]
     if missing:
         raise ValueError(f"task missing required fields: {', '.join(missing)}")

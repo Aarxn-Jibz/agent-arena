@@ -48,6 +48,16 @@ class LoadTaskTest(unittest.TestCase):
     def test_loads_inline_dict(self):
         self.assertEqual(load_task(ADD_TASK)["id"], "001")
 
+    def test_rejects_non_object_json(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(["not", "an", "object"], f)
+            path = f.name
+        try:
+            with self.assertRaisesRegex(ValueError, "JSON object"):
+                load_task(path)
+        finally:
+            os.unlink(path)
+
     def test_loads_json_file(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(ADD_TASK, f)
@@ -128,6 +138,13 @@ class EvaluateTest(unittest.TestCase):
         self.assertTrue(result.compiled)
         self.assertEqual(result.passed, 0)
         self.assertFalse(result.success)
+
+    def test_empty_expected_output(self):
+        task = dict(ADD_TASK, tests=[{"input": "", "expected_output": ""}])
+        silent = "int main(void){return 0;}\n"
+        noisy = '#include <stdio.h>\nint main(void){puts("nope");return 0;}\n'
+        self.assertTrue(evaluate(silent, task).success)
+        self.assertFalse(evaluate(noisy, task).success)
 
     def test_execution_timing_recorded(self):
         code = '#include <stdio.h>\nint main(void){long long i;for(i=0;i<10000000;i++);return 0;}\n'

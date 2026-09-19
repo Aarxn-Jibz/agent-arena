@@ -48,9 +48,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.attempt < 1:
         print("error: --attempt must be >= 1", file=sys.stderr)
         return 2
-    task = load_task(args.task)
-    source = Path(args.source).read_text(encoding="utf-8")
-    result = evaluate(source, task, attempt=args.attempt)
+    try:
+        task = load_task(args.task)
+        source = Path(args.source).read_text(encoding="utf-8")
+        result = evaluate(source, task, attempt=args.attempt)
+    except (OSError, ValueError) as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
     if args.log is not None:
         append_trajectory(args.log, trajectory_entry(task, args.attempt, source, asdict(result)))
     if args.json:

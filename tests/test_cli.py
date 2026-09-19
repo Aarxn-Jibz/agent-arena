@@ -91,6 +91,17 @@ class CliRunTest(unittest.TestCase):
             self.assertTrue(first["success"])
             self.assertEqual(first["reward"] - second["reward"], 0.5)
 
+    def test_missing_file_prints_clean_error(self):
+        proc = run_cli("run", "tasks/nope.json", "solutions/add.c")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("error:", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_attempt_below_one_rejected(self):
+        proc = run_cli("run", "tasks/001_add.json", "solutions/add.c", "--attempt", "0")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--attempt must be >= 1", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
