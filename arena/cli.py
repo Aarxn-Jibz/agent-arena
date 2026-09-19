@@ -95,6 +95,20 @@ def _cmd_solve(args) -> int:
         max_attempts=args.attempts,
         log_path=args.log,
     )
+    for attempt, (source, eval_res, reward) in enumerate(
+        zip(result.sources, result.eval_results, result.rewards), start=1
+    ):
+        print(f"=== attempt {attempt} ===")
+        print("generated C:")
+        print(source)
+        print(f"compiled:  {'yes' if eval_res['compiled'] else 'no'}")
+        if eval_res["compile_stderr"]:
+            print("compiler stderr:")
+            print(eval_res["compile_stderr"])
+        print(f"tests:     {eval_res['passed']}/{eval_res['total']} passed")
+        print(f"runtime:   {eval_res['runtime_ms']} ms")
+        print(f"reward:    {reward}")
+        print()
     print(f"task:     {task['id']} - {task['title']}")
     print(f"success:  {'yes' if result.success else 'no'}  after {result.attempts} attempt(s)")
     print(f"rewards:  {result.rewards}")

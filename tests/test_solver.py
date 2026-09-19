@@ -62,6 +62,7 @@ class SolveLoopTest(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.attempts, 2)
         self.assertEqual(len(result.rewards), 2)
+        self.assertEqual(len(result.sources), result.attempts)
         # attempt 2 pays the -0.5 retry penalty
         self.assertEqual(result.rewards, [0.0, 15.5])
         self.assertNotIn("this is not C", result.last_source)

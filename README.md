@@ -30,7 +30,17 @@ that will produce the data.
   ```
   Compile failures score 0.
 - JSONL trajectory logging (one JSON object per attempt).
-- Small CLI and 3 sample tasks.
+- Small CLI, 3 sample tasks, and demo solutions.
+- **Solver agent** (experimental): `HuggingFaceTB/SmolLM2-360M-Instruct` generates
+  C from the task prompt, the arena judges it with TCC, compiler/test feedback
+  is returned to the model, and the loop retries up to a configurable cap.
+  Generation uses light sampling (temperature 0.9, top_p 0.9, bounded at 512
+  tokens) so retries can actually vary; greedy decoding repeatedly produced
+  byte-identical, feedback-unaware answers on the small model.
+- **Verified real runs** (see below): task 001 solved on attempt 1; task 002
+  and 003 failed within 3 attempts — SmolLM2-360M does not yet reliably follow
+  strict exact-output constraints, which is precisely the data this
+  environment is meant to collect.
 
 ## Architecture
 
@@ -49,10 +59,12 @@ problem (task JSON)
 | `arena/runner.py` | TCC compile + process execution with timeout |
 | `arena/evaluate.py` | task loading, output normalization, test evaluation, reward |
 | `arena/log.py` | JSONL trajectory logging |
+| `arena/solver.py` | Solver retry loop (model-agnostic: feedback + retries) |
+| `arena/solver_llm.py` | optional transformers adapter (SmolLM2-360M-Instruct) |
 | `arena/cli.py`, `arena/__main__.py` | `python -m arena` command line |
 | `tasks/*.json` | sample tasks (add, max of array, reverse string) |
 | `solutions/*.c` | demo solutions incl. compile-error / wrong / infinite cases |
-| `tests/` | `unittest` suite (52 tests) |
+| `tests/` | `unittest` suite (61 tests) |
 
 ## Setup
 
@@ -72,7 +84,16 @@ sudo apt-get install tcc
 > `PATH="$HOME/.local/bin:$PATH"` or set
 > `TCC_BIN=/path/to/tcc`. **TCC is the only C compiler used by the arena.**
 
-No Python dependencies outside the standard library are required.
+No Python dependencies outside the standard library are required for the
+deterministic arena. The optional LLM Solver additionally needs
+`torch` + `transformers` (CPU build is enough); they are installed in the
+project `.venv`:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+.venv/bin/pip install transformers
+```
 
 ## Usage
 
@@ -88,6 +109,9 @@ python3 -m arena run --json tasks/002_max_array.json solutions/max_array.c
 
 # Append the attempt to a trajectory JSONL (retry loop friendly)
 python3 -m arena run tasks/001_add.json solutions/add.c --log trajectories/train.jsonl --attempt 1
+
+# Run the LLM Solver retry loop (hidden tests stay hidden from the model)
+.venv/bin/python -m arena solve tasks/001_add.json --attempts 3 --log trajectories/solver_001.jsonl
 
 # Exit code is 0 on pass, 1 on fail, 2 on usage/io error
 ```
@@ -124,17 +148,44 @@ loop — but driven by a submitted C file instead of a model.
 and elapsed time in the JSON result (`tests[].*`) plus the last test's
 `program_stdout` / `program_stderr` / `program_exit_code` at the top level.
 
+## Experimental observations (SmolLM2-360M-Instruct, CPU)
+
+All runs used greedy-bounded light sampling (temperature 0.9, top_p 0.9, at
+most 512 generated tokens; sampling – not greedy – because greedy decoding
+repeatedly returned byte-identical, feedback-unaware programs). The prompt is:
+solver instructions, a clearly labeled **different**-task exemplar, the real
+task exactly once, then a request for one C code block. Expected outputs of the
+real task are never shown to the model; the TCC/test environment is the only
+judge.
+
+Verified real path: model → generated C → TCC compile → tests → compiler/test
+feedback → retry up to 3 attempts → deterministic reward → JSONL trajectory.
+
+- **task 001 (add two integers): a real successful rollout.** The model
+  generated the minimal correct program on attempt 1; 4/4 tests passed, reward
+  16.0, trajectory `trajectories/solver_001.jsonl`.
+- **task 002 (max of array): failed within 3 attempts** — 1/5, then 4/5
+  (subtle input-scanner bug), then a compile error (missing `<limits.h>`),
+  rewards [3.0, 8.5, 0.0].
+- **task 003 (reverse string): failed within 3 attempts** — the same
+  non-reversing, labeled program repeated 3 times, rewards [1.0, 0.5, 0.0].
+- Earlier repeated trials showed substantial stochasticity and inconsistent
+  success for task 001 (success in some trials after 1-2 attempts, failure in
+  others). The small model does not yet reliably follow exact-output
+  constraints, which is precisely the kind of signal this environment is meant
+  to collect.
+- **No model weight training, fine-tuning, LoRA, or MARL/policy optimization
+  has been performed.** The model runs in inference mode only; trajectories are
+  collected for future work.
+
 ## Deliberate future work (not implemented)
 
-- **Solver agent**: an LLM (targeting `HuggingFaceTB/SmolLM2-360M-Instruct`)
-  generates C from the task prompt, receives compiler/test feedback, and
-  retries until success or a max-attempt cap — the deterministic arena above
-  is the judge.
 - **Challenger agent**: LLM-generated problems with deterministically validated
   test cases.
 - **Adversarial MARL / PPO / GRPO / fine-tuning / policy optimization**: none of
-  this exists yet. The arena only produces data.
+  this exists yet. The arena and Solver only produce data.
 
-Everything currently in the repository is deterministic: an evaluation of the
+Everything in the deterministic arena is deterministic: an evaluation of the
 same (source, task) yields the same reward, the same pass/fail results, and the
-same trajectories except for wall-clock timing fields.
+same trajectories except for wall-clock timing fields. LLM generation is
+stochastic by design and is recorded verbatim in each attempt's trajectory.
