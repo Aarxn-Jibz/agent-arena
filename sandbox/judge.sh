@@ -12,7 +12,14 @@ echo 0 > program.status
 echo 0 > elapsed_ms
 
 set +e
-(ulimit -f 8192; timeout "$COMPILE_SECONDS" tcc solution.c -o solution) > compile.stdout 2> compile.stderr
+if [ -d src ]; then
+    find src -type f -exec chmod 0644 {} +
+    c_files=$(find src -type f -name '*.c' | sort)
+else
+    c_files=
+fi
+# Candidate paths are validated by the host before archive creation.
+(ulimit -f 8192; timeout "$COMPILE_SECONDS" tcc solution.c $c_files -o solution) > compile.stdout 2> compile.stderr
 compile_status=$?
 set -e
 echo "$compile_status" > compile.status

@@ -9,6 +9,13 @@ from arena.sandbox import SandboxConfig, run_c
 @unittest.skipUnless(os.environ.get("RUN_DOCKER_SANDBOX_TESTS") == "1",
                      "requires local Docker sandbox image and daemon access")
 class SandboxAdversarialTest(unittest.TestCase):
+    def test_multifile_build(self):
+        result = run_c({'solution.c': '#include "src/api.h"\nint main(void){return value()!=7;}',
+                        'src/api.h': 'int value(void);',
+                        'src/api.c': 'int value(void){return 7;}'})
+        self.assertTrue(result.compiled)
+        self.assertEqual(result.exit_code, 0)
+
     def test_network_is_unavailable(self):
         source = '''#include <sys/socket.h>
 #include <netinet/in.h>

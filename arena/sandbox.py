@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 import subprocess
 import tarfile
 import uuid
@@ -42,10 +43,17 @@ class SandboxResult:
     stderr_bytes: bytes = b""
 
 
-def _input_archive(source: str, stdin: bytes) -> bytes:
+def _input_archive(source: str | dict[str, str], stdin: bytes) -> bytes:
+    files = {"solution.c": source} if isinstance(source, str) else source
+    if "solution.c" not in files or len(files) > 32:
+        raise ValueError("candidate needs solution.c and at most 32 source files")
+    for name, content in files.items():
+        if (not isinstance(name, str) or not re.fullmatch(r"(?:src/)?[A-Za-z0-9_-]+\.(?:c|h)", name)
+                or not isinstance(content, str)):
+            raise ValueError("unsafe candidate source path or content")
     payload = io.BytesIO()
     with tarfile.open(fileobj=payload, mode="w") as archive:
-        for name, data in (("solution.c", source.encode("utf-8")), ("stdin.txt", stdin)):
+        for name, data in [(name, content.encode("utf-8")) for name, content in files.items()] + [("stdin.txt", stdin)]:
             info = tarfile.TarInfo(name)
             info.size = len(data)
             info.mode = 0o644
@@ -53,14 +61,15 @@ def _input_archive(source: str, stdin: bytes) -> bytes:
     return payload.getvalue()
 
 
-def run_c(source: str, stdin: str | bytes = "", config: SandboxConfig = SandboxConfig(),
+def run_c(source: str | dict[str, str], stdin: str | bytes = "", config: SandboxConfig = SandboxConfig(),
           args: tuple[str, ...] = ()) -> SandboxResult:
     """Build and run once in a disposable offline container.
 
     Requires a previously built local image. Never mounts experiment files.
     """
     stdin_bytes = stdin.encode("utf-8") if isinstance(stdin, str) else stdin
-    if len(source.encode("utf-8")) + len(stdin_bytes) > (config.tmpfs_mb // 2) * 524288:
+    source_bytes = len(source.encode("utf-8")) if isinstance(source, str) else sum(len(x.encode("utf-8")) for x in source.values())
+    if source_bytes + len(stdin_bytes) > (config.tmpfs_mb // 2) * 524288:
         raise ValueError("source and input exceed sandbox workspace budget")
     name = f"arena-{uuid.uuid4().hex}"
     half = config.tmpfs_mb // 2
