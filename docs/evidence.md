@@ -22,6 +22,7 @@ Required episode fields:
 | `outcome` | `accepted` or `rejected`. |
 | `timestamps` | ISO-8601 `started_at`, `candidate_at`, `finished_at`. |
 | `hashes` | Added by the writer: SHA-256 of challenge, candidate, and patch when present. |
+| `reference_reads` | Optional list of `{document, section, read_at}` for local reference material consulted by an agent. |
 
 The writer adds `schema_version: 1`. A real run should also retain an immutable
 run configuration containing benchmark and generator versions, model revision,
@@ -34,7 +35,7 @@ without relying on an agent's summary. A rejected record has `git_after: null`.
 `episode_id`, `actor`, `kind`, and `at`. The fixed order is:
 
 1. `challenger/challenge`: request and rationale.
-2. `solver/candidate`: response, complete code, and patch.
+2. `solver/candidate`: response, complete code, patch, and reference reads.
 3. `judge/verdict`: correctness, performance, resource usage, feedback,
    rewards, and accepted/rejected outcome.
 

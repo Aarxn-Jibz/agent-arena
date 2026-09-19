@@ -23,7 +23,7 @@
 <header><h1>Agent Arena</h1><label>Run <select id="runs"></select></label><span id="context" class="muted">Waiting for evidence</span></header>
 <main><nav><h2>HISTORY</h2><div id="history"></div></nav><article>
   <section><h2>CHALLENGER</h2><h3>Request and parameters</h3><pre id="request"></pre><h3>Rationale / targeted weakness</h3><pre id="rationale"></pre></section>
-  <section><h2>SOLVER</h2><h3>Response / approach</h3><pre id="response"></pre><h3>Candidate source</h3><pre id="candidate"></pre><h3>Diff from previous accepted version</h3><pre id="diff"></pre></section>
+  <section><h2>SOLVER</h2><h3>Response / approach</h3><pre id="response"></pre><h3>References read</h3><pre id="references"></pre><h3>Candidate source</h3><pre id="candidate"></pre><h3>Diff from previous accepted version</h3><pre id="diff"></pre></section>
   <section><h2>JUDGE</h2><h3>Build</h3><pre id="build"></pre><h3>Correctness</h3><pre id="correctness"></pre><h3>Performance</h3><pre id="performance"></pre><h3>Resource usage</h3><pre id="resources"></pre><h3>Rewards and verdict</h3><pre id="verdict"></pre></section>
 </article></main>
 <script>
@@ -37,7 +37,7 @@ async function selectEpisode(id) {
   const elapsed = Date.parse(e.timestamps?.finished_at) - Date.parse(e.timestamps?.started_at);
   $('context').textContent = `${currentRun} · ${e.benchmark} · episode ${id} · ${Number.isFinite(elapsed) ? (elapsed / 1000).toFixed(1) + 's' : 'elapsed unknown'}`;
   show('request', e.challenger?.request); show('rationale', e.challenger?.rationale || 'Not supplied');
-  show('response', e.solver?.response); show('candidate', e.solver?.candidate); show('diff', e.source_diff);
+  show('response', e.solver?.response); show('references', e.reference_reads || []); show('candidate', e.solver?.candidate); show('diff', e.source_diff);
   show('build', e.build); show('correctness', e.correctness); show('performance', e.performance);
   show('resources', e.judge?.resource_usage); show('verdict', {feedback: e.judge?.feedback, reward_inputs: e.judge?.reward_inputs, rewards: e.rewards, outcome: e.outcome});
 }

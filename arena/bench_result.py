@@ -9,7 +9,7 @@ def record_judgement(root, *, benchmark: str, run_id: str, episode_id: int,
                      challenge: dict, source: str, evaluation: dict,
                      git_before: str, git_after: str | None,
                      solver_response: str = "", rationale: str | None = None,
-                     patch: str | None = None):
+                     patch: str | None = None, reference_reads: list[dict] | None = None):
     if evaluation["accepted"] != bool(git_after):
         raise ValueError("git_after must be supplied exactly when Judge accepts")
     seed = challenge["seed"]
@@ -17,6 +17,7 @@ def record_judgement(root, *, benchmark: str, run_id: str, episode_id: int,
               "seeds": {"corpus": seed}, "git_before": git_before,
               "challenger": {"request": challenge, "rationale": rationale},
               "solver": {"response": solver_response, "candidate": source, "patch": patch},
+              "reference_reads": reference_reads or [],
               "input_generation": {"generator": f"{benchmark}-v1", "seed": seed,
                                    "config": challenge},
               "build": evaluation["build"], "correctness": evaluation["correctness"],

@@ -33,7 +33,8 @@ def viewer_events(record: dict) -> list[dict]:
          "at": record["timestamps"]["candidate_at"],
          "response": record["solver"]["response"],
          "candidate": record["solver"]["candidate"],
-         "patch": record["solver"].get("patch")},
+         "patch": record["solver"].get("patch"),
+         "reference_reads": record.get("reference_reads", [])},
         {**base, "schema_version": SCHEMA_VERSION, "actor": "judge", "kind": "verdict",
          "at": record["timestamps"]["finished_at"],
          "correctness": record["correctness"],
@@ -84,6 +85,13 @@ def write_episode(root: str | Path, record: dict) -> tuple[Path, Path]:
         raise ValueError("input generation recipe incomplete")
     if not {"exit_code", "stdout", "stderr"} <= record["build"].keys():
         raise ValueError("build must retain compiler exit code, stdout and stderr")
+    reads = record.get("reference_reads", [])
+    if not isinstance(reads, list):
+        raise ValueError("reference_reads must be a list")
+    for item in reads:
+        if not isinstance(item, dict) or not {"document", "section", "read_at"} <= item.keys():
+            raise ValueError("reference read needs document, section and read_at")
+        datetime.fromisoformat(item["read_at"])
 
     saved = dict(record)
     saved["schema_version"] = SCHEMA_VERSION
