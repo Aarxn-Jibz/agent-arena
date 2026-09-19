@@ -77,7 +77,7 @@ def run_c(source: str, stdin: str | bytes = "", config: SandboxConfig = SandboxC
         f"--env=RUN_SECONDS={config.timeout_seconds}",
         f"--env=COMPILE_SECONDS={config.compile_seconds}",
         f"--env=OUTPUT_BYTES={config.output_bytes}",
-        f"--env=OUTPUT_KB={(config.output_bytes + 1023) // 1024}",
+        f"--env=OUTPUT_BLOCKS={(config.output_bytes + 511) // 512}",
         config.image, *args,
     ]
     try:
