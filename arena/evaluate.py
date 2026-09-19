@@ -43,6 +43,37 @@ def normalize_output(text: str) -> str:
     return "\n".join(lines)
 
 
+# Reward shaping constants. Deterministic and intentionally simple so the
+# scoring is easy to explain: every input maps to exactly one reward value.
+REWARD_FULL_TEST_SCORE = 10.0  # proportional: 10 * passed / total
+COMPILE_REWARD = 1.0           # small reward for producing compiling code
+ALL_PASS_BONUS = 5.0           # bonus when every test passes without timeout
+TIMEOUT_PENALTY = -5.0         # any timeout forfeits points
+RUNTIME_ERROR_PENALTY = -1.0   # per test that exits with a non-zero code
+ATTEMPT_PENALTY = -0.5         # small cost for each retry beyond the first
+
+
+def compute_reward(passed: int, total: int, timed_out: bool,
+                   runtime_errors: int, attempt: int = 1) -> float:
+    """Deterministic reward for one evaluated attempt.
+
+    reward = 1 (compiled) + 10 * passed/total
+             + 5 (all pass, no timeout)
+             - 5 (any timeout) - 1 * runtime_errors
+             - 0.5 * (attempt - 1)
+
+    Compile failures get 0.0 and never reach this function.
+    """
+    score = COMPILE_REWARD + REWARD_FULL_TEST_SCORE * passed / total
+    if total > 0 and passed == total and not timed_out:
+        score += ALL_PASS_BONUS
+    if timed_out:
+        score += TIMEOUT_PENALTY
+    score += RUNTIME_ERROR_PENALTY * runtime_errors
+    score += ATTEMPT_PENALTY * (attempt - 1)
+    return round(score, 4)
+
+
 @dataclasses.dataclass
 class TestResult:
     input: str
@@ -69,6 +100,7 @@ class EvalResult:
     program_stdout: str
     program_stderr: str
     tests: list[TestResult]
+    reward: float
     success: bool
 
 
@@ -95,6 +127,7 @@ def evaluate(source: str, task: dict, attempt: int = 1) -> EvalResult:
                 program_stdout="",
                 program_stderr="",
                 tests=[],
+                reward=0.0,
                 success=False,
             )
         results = []
@@ -120,6 +153,8 @@ def evaluate(source: str, task: dict, attempt: int = 1) -> EvalResult:
                 )
             )
         passed = sum(r.passed for r in results)
+        timed_out = any(r.timed_out for r in results)
+        runtime_errors = sum(1 for r in results if not r.timed_out and r.exit_code != 0)
         return EvalResult(
             compiled=True,
             compile_exit_code=comp.exit_code,
@@ -128,10 +163,11 @@ def evaluate(source: str, task: dict, attempt: int = 1) -> EvalResult:
             passed=passed,
             total=len(results),
             runtime_ms=round(sum(r.elapsed_ms for r in results), 3),
-            timed_out=any(r.timed_out for r in results),
+            timed_out=timed_out,
             program_exit_code=results[-1].exit_code,
             program_stdout=results[-1].stdout,
             program_stderr=results[-1].stderr,
             tests=results,
+            reward=compute_reward(passed, len(results), timed_out, runtime_errors, attempt),
             success=passed == len(results),
         )
