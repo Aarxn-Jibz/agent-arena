@@ -20,9 +20,15 @@ if [ "$compile_status" -eq 0 ]; then
     chmod 0755 solution
     start_ns=$(date +%s%N)
     set +e
-    (ulimit -f "$OUTPUT_KB"; timeout --signal=TERM --kill-after=1s "$RUN_SECONDS" \
-        setpriv --reuid=65534 --regid=65534 --clear-groups -- /work/solution \
-        "$@" < /work/stdin.txt) > program.stdout 2> program.stderr
+    if [ "${1:-}" = "--http" ]; then
+        timeout --signal=TERM --kill-after=1s "$RUN_SECONDS" \
+            python3 /usr/local/bin/http-driver /work/stdin.txt \
+            > program.stdout 2> program.stderr
+    else
+        (ulimit -f "$OUTPUT_KB"; timeout --signal=TERM --kill-after=1s "$RUN_SECONDS" \
+            setpriv --reuid=65534 --regid=65534 --clear-groups -- /work/solution \
+            "$@" < /work/stdin.txt) > program.stdout 2> program.stderr
+    fi
     program_status=$?
     set -e
     end_ns=$(date +%s%N)

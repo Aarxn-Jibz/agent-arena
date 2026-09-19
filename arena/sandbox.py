@@ -67,7 +67,7 @@ def run_c(source: str, stdin: str | bytes = "", config: SandboxConfig = SandboxC
     command = [
         "docker", "run", "--pull=never", "--rm", "--name", name, "-i",
         "--network=none", "--read-only", "--cap-drop=ALL",
-        "--cap-add=SETUID", "--cap-add=SETGID",
+        "--cap-add=SETUID", "--cap-add=SETGID", "--cap-add=DAC_OVERRIDE", "--cap-add=KILL",
         "--security-opt=no-new-privileges",
         f"--cpus={config.cpus}", f"--memory={config.memory_mb}m",
         f"--memory-swap={config.memory_mb}m", f"--pids-limit={config.pids}",

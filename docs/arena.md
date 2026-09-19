@@ -87,8 +87,9 @@ Default limits: one CPU quota, 256 MB RAM with swap disabled, 64 PIDs, two
 temporary filesystems totaling 128 MB, 3-second candidate timeout, 10-second
 build timeout, and 64 KiB returned per output stream. All are configurable by
 `SandboxConfig`. The container is read-only apart from those tmpfs mounts,
-uses no host bind mounts, drops capabilities except the trusted script's
-temporary UID/GID switch, runs candidate code as UID 65534, and is removed
+uses no host bind mounts, grants the trusted Judge only the UID/GID, filesystem
+access, and signal capabilities needed to manage an unprivileged candidate,
+runs candidate code as UID 65534 without those capabilities, and is removed
 after the evaluation. The scratch tmpfs cannot execute files. Tests cover
 network, filesystem, host-file/tool, memory, PID, timeout, and output limits.
 
