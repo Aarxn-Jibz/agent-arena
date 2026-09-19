@@ -29,8 +29,8 @@ The default soft artifact limit is 15 GiB and hard limit is 20 GiB, excluding sh
 ## Commands
 
 ```sh
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv/bin/python -m arena experiment --run-id overnight-20260919 --hours 10 --seed 42 --benchmarks compression,csv,http,expression,graph --selection-mode adaptive --soft-gb 15 --hard-gb 20
-HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv/bin/python -m arena experiment --run-id overnight-20260919 --hours 10 --seed 42 --benchmarks compression,csv,http,expression,graph --selection-mode adaptive --soft-gb 15 --hard-gb 20 --resume
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 OMP_NUM_THREADS=4 .venv/bin/python -m arena experiment --run-id overnight-20260919 --hours 10 --seed 42 --benchmarks compression,csv,http,expression,graph --selection-mode adaptive --soft-gb 15 --hard-gb 20
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 OMP_NUM_THREADS=4 .venv/bin/python -m arena experiment --run-id overnight-20260919 --hours 10 --seed 42 --benchmarks compression,csv,http,expression,graph --selection-mode adaptive --soft-gb 15 --hard-gb 20 --resume
 .venv/bin/python -m arena.viewer --root trajectories/episodes --port 8765
 ```
 
