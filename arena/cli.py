@@ -101,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    actual = sys.argv[1:] if argv is None else argv
+    if actual and actual[0] == "experiment":
+        from .experiment import main as experiment_main
+        experiment_main(actual[1:])
+        return 0
     args = build_parser().parse_args(argv)
     if args.command == "solve":
         return _cmd_solve(args)

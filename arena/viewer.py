@@ -34,7 +34,7 @@ def episode_detail(records: list[dict], episode_id: int) -> dict | None:
         if record["episode_id"] == episode_id:
             candidate = record.get("solver", {}).get("candidate", "")
             record = dict(record)
-            record["source_diff"] = ("".join(difflib.unified_diff(
+            record["source_diff"] = record.get("solver", {}).get("patch") or ("".join(difflib.unified_diff(
                 prior.splitlines(keepends=True), candidate.splitlines(keepends=True),
                 fromfile="previous accepted", tofile="candidate")) if prior is not None
                 else "No previous accepted version in this run.")

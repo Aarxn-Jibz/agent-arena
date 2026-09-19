@@ -1,0 +1,495 @@
+"""Offline Challenger/Solver experiment. Only benchmark judges execute candidate C."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .compression import CompressionBenchmark
+from .csv_benchmark import CsvBenchmark
+from .expression import ExpressionBenchmark
+from .graph_benchmark import GraphBenchmark
+from .http_benchmark import HttpBenchmark
+from .secondary import CacheBenchmark, LogBenchmark, SearchBenchmark
+from .evidence import viewer_events, write_episode
+from .experiment_context import apply_changes, parse_object, selected_context, source_diff
+from .sandbox import SandboxConfig
+
+TRAIN = {'compression': CompressionBenchmark, 'csv': CsvBenchmark, 'http': HttpBenchmark,
+         'expression': ExpressionBenchmark, 'graph': GraphBenchmark}
+VALIDATION = {'cache': CacheBenchmark, 'log': LogBenchmark, 'search': SearchBenchmark}
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def atomic_json(path: Path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + '.tmp')
+    with temp.open('w', encoding='utf-8') as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.write('\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temp, path)
+
+
+def git(*args, cwd=None):
+    p = subprocess.run(['git', *args], cwd=cwd or ROOT, text=True, capture_output=True, check=True)
+    return p.stdout.strip()
+
+
+def memory_note(text, limit=600):
+    return ' '.join(str(text).split())[:limit]
+
+
+def push_memory(items: list[str], note: str, limit=600):
+    return (items + [memory_note(note, limit)])[-5:]
+
+
+def project_files(workspace: Path, benchmark: str):
+    root = workspace / 'solutions' / benchmark
+    return {str(path.relative_to(root)): path.read_text() for path in sorted(root.rglob('*'))
+            if path.is_file() and path.suffix in ('.c', '.h')}
+
+
+def install_files(workspace: Path, benchmark: str, files: dict[str, str]):
+    root = workspace / 'solutions' / benchmark
+    root.mkdir(parents=True, exist_ok=True)
+    for path in root.rglob('*'):
+        if path.is_file() and path.suffix in ('.c', '.h') and str(path.relative_to(root)) not in files:
+            path.unlink()
+    for name, content in files.items():
+        dest = root / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content)
+
+
+def storage_bytes(path: Path):
+    return sum(p.stat().st_size for p in path.rglob('*') if p.is_file() and not p.is_symlink()) if path.exists() else 0
+
+
+def safe_report(run_dir: Path, state: dict):
+    lines = [f'# Experiment {state["run_id"]}', '', f'- Episodes: {state["episode"]}',
+             f'- Started: {state["started_at"]}', f'- Deadline: {state.get("deadline")}',
+             f'- Accepted Git HEAD: {state["accepted_head"]}',
+             f'- Model: {state["model_id"]} @ {state["model_revision"]}',
+             f'- Frozen model weights: yes', '', '## Outcomes', '']
+    for path in sorted(run_dir.glob('[0-9]*.json')):
+        try:
+            item = json.loads(path.read_text())
+            lines.append(f'- {item["episode_id"]} {item["benchmark"]}: {item["outcome"]}; '
+                         f'{item["judge"]["feedback"]}; Git {item["git_after"] or "unchanged"}')
+        except (ValueError, KeyError):
+            pass
+    path = run_dir / 'report.md'
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text('\n'.join(lines) + '\n')
+    os.replace(tmp, path)
+
+
+def rebuild_events(run_dir: Path):
+    lines = []
+    for path in sorted(run_dir.glob('[0-9]*.json')):
+        try:
+            record = json.loads(path.read_text())
+            lines.extend(json.dumps(event, ensure_ascii=False) for event in viewer_events(record))
+        except (ValueError, KeyError):
+            continue
+    target = run_dir / 'events.jsonl'
+    temp = target.with_suffix('.tmp')
+    temp.write_text('\n'.join(lines) + ('\n' if lines else ''))
+    os.replace(temp, target)
+
+
+def score(evaluation: dict):
+    c = evaluation['correctness']
+    return c['passed'] / max(1, c['total'])
+
+
+def primary_ms(evaluation: dict):
+    p = evaluation['performance']
+    for key in ('median_ms', 'compression_median_ms', 'p95_latency_ms', 'median_latency_ms'):
+        value = p.get(key)
+        if isinstance(value, (float, int)):
+            return float(value)
+    return None
+
+
+def accept(candidate: dict, baseline: dict | None, benchmark: str = '') -> tuple[bool, str]:
+    if not candidate['accepted']:
+        return False, 'Judge rejected correctness or resource limits'
+    if baseline is None or not baseline['accepted']:
+        return True, 'first passing candidate or correctness improvement'
+    if benchmark == 'compression':
+        old_cases = baseline['performance'].get('cases', [])
+        new_cases = candidate['performance'].get('cases', [])
+        if old_cases and len(old_cases) == len(new_cases):
+            original = sum(x['original_bytes'] for x in old_cases)
+            gain = sum(x['compressed_bytes'] for x in old_cases) - sum(x['compressed_bytes'] for x in new_cases)
+            old_unpack = baseline['performance'].get('decompression_median_ms')
+            new_unpack = candidate['performance'].get('decompression_median_ms')
+            old_pack = baseline['performance'].get('compression_median_ms')
+            new_pack = candidate['performance'].get('compression_median_ms')
+            if (gain >= max(16, original * .05) and
+                    all(a is None or b is None or b <= a * 1.25 + 5
+                        for a, b in ((old_pack, new_pack), (old_unpack, new_unpack)))):
+                return True, 'at least 5% and 16 bytes smaller without material speed regression'
+    old, new = primary_ms(baseline), primary_ms(candidate)
+    if old is None or new is None:
+        return False, 'no comparable performance metric'
+    if old - new >= max(5.0, old * 0.10):
+        if benchmark == 'compression':
+            old_size = sum(x['compressed_bytes'] for x in baseline['performance'].get('cases', []))
+            new_size = sum(x['compressed_bytes'] for x in candidate['performance'].get('cases', []))
+            if new_size > old_size + max(16, old_size * .05):
+                return False, 'speed gain costs more than 5% and 16 compressed bytes'
+        return True, 'at least 10% and 5 ms faster with full correctness'
+    return False, 'performance difference below 10% and 5 ms noise threshold'
+
+
+def synthetic_failure(benchmark, challenge, reason):
+    stamp = now()
+    return {'started_at': stamp, 'finished_at': stamp,
+            'build': {'exit_code': None, 'stdout': '', 'stderr': reason[:65536]},
+            'correctness': {'passed': 0, 'total': 1, 'cases': []}, 'performance': {},
+            'reward_inputs': {'solver_reward': 0.0, 'challenger_reward': 1.0},
+            'feedback': reason[:1000], 'accepted': False}
+
+
+def prepare_run(run_dir: Path, run_id: str, seed: int, model_revision: str, hours: float | None,
+                benchmarks: list[str], config: dict, resume: bool):
+    state_path = run_dir / 'state.json'
+    workspace = run_dir / 'workspace'
+    if resume:
+        state = json.loads(state_path.read_text())
+        if (state['run_id'] != run_id or state['seed'] != seed or state['benchmarks'] != benchmarks
+                or state['model_revision'] != model_revision):
+            raise ValueError('resume configuration differs from checkpoint')
+        for key in ('challenger_tokens', 'solver_tokens', 'cpus', 'memory_mb', 'pids',
+                    'tmpfs_mb', 'timeout_seconds', 'output_bytes', 'soft_gb', 'hard_gb'):
+            if state['config'][key] != config[key]:
+                raise ValueError(f'resume {key} differs from checkpoint')
+        return state, workspace
+    if run_dir.exists() and any(run_dir.iterdir()):
+        raise FileExistsError('run directory already exists; use --resume')
+    run_dir.mkdir(parents=True, exist_ok=True)
+    branch = 'experiment/' + run_id
+    git('worktree', 'add', '-b', branch, str(workspace), 'HEAD')
+    head = git('rev-parse', 'HEAD', cwd=workspace)
+    started = time.time()
+    state = {'run_id': run_id, 'seed': seed, 'episode': 0, 'started_at': now(),
+             'deadline': started + hours * 3600 if hours else None,
+             'benchmarks': benchmarks, 'model_id': 'HuggingFaceTB/SmolLM2-360M-Instruct',
+             'model_revision': model_revision, 'config': config, 'branch': branch,
+             'accepted_head': head, 'challenger_memory': [], 'solver_memory': [],
+             'selection_counts': {name: 0 for name in benchmarks}}
+    atomic_json(state_path, state)
+    atomic_json(run_dir / 'manifest.json', state)
+    return state, workspace
+
+
+def reconcile(run_dir: Path, state: dict, workspace: Path):
+    pending = run_dir / 'pending.json'
+    if not pending.exists():
+        if git('rev-parse', 'HEAD', cwd=workspace) != state['accepted_head']:
+            raise RuntimeError('accepted worktree changed outside experiment')
+        rebuild_events(run_dir)
+        return state
+    transaction = json.loads(pending.read_text())
+    episode = transaction['episode_id']
+    head = git('rev-parse', 'HEAD', cwd=workspace)
+    if transaction.get('ready'):
+        record = transaction['record']
+        if record['outcome'] == 'accepted':
+            if head == state['accepted_head']:
+                install_files(workspace, record['benchmark'], transaction['files'])
+                git('add', '--', f'solutions/{record["benchmark"]}', cwd=workspace)
+                git('commit', '-m', transaction['commit_message'], cwd=workspace)
+                head = git('rev-parse', 'HEAD', cwd=workspace)
+            elif (git('rev-parse', 'HEAD^', cwd=workspace) != state['accepted_head'] or
+                  git('log', '-1', '--format=%B', cwd=workspace) != transaction['commit_message']):
+                raise RuntimeError('unexpected accepted commit during recovery')
+            record['git_after'] = head
+        elif head != state['accepted_head']:
+            raise RuntimeError('unexpected Git HEAD during rejected episode')
+        if not (run_dir / f'{episode:06d}.json').exists():
+            write_episode(run_dir.parent, record)
+        state = transaction['next_state']
+        state['accepted_head'] = head
+        atomic_json(run_dir / 'state.json', state)
+    else:
+        if head != state['accepted_head']:
+            raise RuntimeError('incomplete unjudged episode changed Git HEAD')
+        interrupted = run_dir / f'interrupted-{episode:06d}-{int(time.time())}.json'
+        os.replace(pending, interrupted)
+        rebuild_events(run_dir)
+        return state
+    pending.unlink()
+    rebuild_events(run_dir)
+    safe_report(run_dir, state)
+    return state
+
+
+def choose_challenge(model, benchmark, public_spec: str, seed: int, memory: list[str],
+                     recent: list[dict], max_tokens: int):
+    schema = benchmark.initialize(seed)
+    system = ('You are Challenger. Propose a valid benchmark challenge, not a solution. '
+              'Return ONLY JSON: {"challenge": {...}, "rationale": "..."}. '
+              'Keep rationale under 100 words. Do not suggest implementation.')
+    prompt = (f'Public specification:\n{public_spec[:6000]}\nAllowed challenge fields and starting values: '
+              f'{json.dumps(schema)}\nThe seed MUST be {seed}. Respect documented bounds.\n'
+              f'Judge outcomes: {json.dumps(recent[-3:])[:1500]}\n'
+              f'Your last five interpretations (may be wrong): {json.dumps(memory[-5:])}')
+    attempts = []
+    for retry in range(2):
+        generated = model.generate([{'role': 'system', 'content': system},
+                                    {'role': 'user', 'content': prompt}],
+                                   seed=seed + retry, max_new_tokens=max_tokens)
+        try:
+            data = parse_object(generated['text'])
+            challenge = data['challenge']
+            valid, reason = benchmark.validate_challenge(challenge)
+            if valid and challenge.get('seed') == seed:
+                return challenge, memory_note(data.get('rationale', ''), 500), attempts, generated
+            attempts.append({'response': generated['text'][:2000], 'error': reason})
+        except (ValueError, KeyError, TypeError) as err:
+            attempts.append({'response': generated['text'][:2000], 'error': str(err)})
+    return schema, 'Validated fallback after two invalid Challenger proposals', attempts, generated
+
+
+def solve(model, public_spec: str, challenge: dict, files: dict[str, str], memory: list[str],
+          latest_diff: str, failures: str, seed: int, max_tokens: int):
+    context, reads = selected_context(files, challenge, latest_diff, failures, ROOT / 'references')
+    system = ('You are Solver. Write C for TinyCC. Return ONLY JSON '
+              '{"summary":"very short approach", "changes":[{"path":"solution.c", "content":"full replacement C text"}]}. '
+              'Modify only changed files. Allowed paths: solution.c or src/<safe-name>.c/.h. '
+              'No external libraries or network. You may choose any implementation strategy.')
+    user = (f'Public specification:\n{public_spec[:5500]}\nValidated challenge:\n{json.dumps(challenge)}\n'
+            f'Accepted source context:\n{context}\nYour last five interpretations (may be wrong): '
+            f'{json.dumps(memory[-5:])}')
+    messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
+    generated = model.generate(messages, seed=seed, max_new_tokens=max_tokens)
+    text = generated['text']
+    try:
+        parsed = parse_object(text)
+    except ValueError:
+        if generated['truncated']:
+            continuation = model.generate(messages + [{'role': 'assistant', 'content': text},
+                                                      {'role': 'user', 'content': 'Continue the same JSON response only.'}],
+                                          seed=seed + 1, max_new_tokens=min(max_tokens, 1000))
+            text += continuation['text']
+            generated['continuation_tokens'] = continuation['tokens']
+        parsed = parse_object(text)
+    updated, changed = apply_changes(files, parsed)
+    return updated, changed, memory_note(parsed.get('summary', ''), 500), text, reads, generated
+
+
+def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxConfig,
+            challenger_tokens: int, solver_tokens: int):
+    number = state['episode'] + 1
+    name = state['benchmarks'][(number - 1) % len(state['benchmarks'])]
+    benchmark = TRAIN.get(name, VALIDATION.get(name))()
+    seed = (state['seed'] + number * 1009) % (2**32)
+    spec = (ROOT / 'docs/benchmarks' / name / 'SPEC.md').read_text()
+    recent = []
+    for path in sorted(run_dir.glob('[0-9]*.json'))[-3:]:
+        item = json.loads(path.read_text())
+        recent.append({'benchmark': item['benchmark'], 'feedback': item['judge']['feedback'],
+                       'outcome': item['outcome']})
+    challenge, rationale, invalid, challenger_gen = choose_challenge(
+        model, benchmark, spec, seed, state['challenger_memory'], recent, challenger_tokens)
+    atomic_json(run_dir / 'pending.json', {'ready': False, 'episode_id': number,
+                                           'challenge': challenge, 'rationale': rationale,
+                                           'challenger_generation': challenger_gen})
+    before = project_files(workspace, name)
+    latest_diff = git('show', '--format=', '--', f'solutions/{name}', cwd=workspace)[:1500]
+    failures = '\n'.join(x['feedback'] for x in recent if x['outcome'] == 'rejected')
+    try:
+        candidate, changed, summary, response, reads, solver_gen = solve(
+            model, spec, challenge, before, state['solver_memory'], latest_diff, failures,
+            seed + 500000, solver_tokens)
+        atomic_json(run_dir / 'pending.json', {'ready': False, 'episode_id': number,
+                                               'challenge': challenge, 'rationale': rationale,
+                                               'solver_response': response[:3 * 1024 * 1024],
+                                               'candidate': candidate})
+        result = benchmark.evaluate(candidate, challenge, config)
+    except (ValueError, KeyError, TypeError, RuntimeError, TimeoutError) as err:
+        candidate, changed, summary, response, reads, solver_gen = before, [], '', str(err), [], {}
+        result = synthetic_failure(benchmark, challenge, f'Invalid Solver response: {err}')
+    try:
+        baseline = benchmark.evaluate(before, challenge, config) if before and changed else None
+    except (RuntimeError, TimeoutError, OSError) as err:
+        baseline = synthetic_failure(benchmark, challenge, f'Baseline Judge failed: {err}')
+        result['accepted'] = False
+    accepted, reason = accept(result, baseline, name) if candidate != before else (False, 'no source change')
+    replay = []
+    if accepted:
+        for path in sorted(run_dir.glob('[0-9]*.json'), reverse=True):
+            old = json.loads(path.read_text())
+            if old['benchmark'] != name or old['outcome'] != 'accepted':
+                continue
+            old_challenge = old['challenger']['request']
+            if old_challenge == challenge:
+                continue
+            try:
+                check = benchmark.evaluate(candidate, old_challenge, config)
+            except (RuntimeError, TimeoutError, OSError) as err:
+                check = synthetic_failure(benchmark, old_challenge, f'Replay Judge failed: {err}')
+            replay.append({'episode_id': old['episode_id'], 'challenge': old_challenge,
+                           'correctness': check['correctness'], 'accepted': check['accepted']})
+            if not check['accepted']:
+                accepted, reason = False, f'correctness/resource regression on episode {old["episode_id"]}'
+                break
+            if len(replay) == 2:
+                break
+    result['acceptance_reason'] = reason
+    result['accepted'] = accepted
+    solver_reward = float(result['reward_inputs']['solver_reward'])
+    challenger_reward = float(result['reward_inputs']['challenger_reward'])
+    solver_memory = push_memory(state['solver_memory'],
+        f'{name}: {summary}; Judge {result["feedback"]}; {reason}; files {", ".join(changed)}')
+    challenger_memory = push_memory(state['challenger_memory'],
+        f'{name}: {rationale}; Solver {summary}; Judge {result["feedback"]}; {reason}', 500)
+    next_state = dict(state)
+    next_state.update({'episode': number, 'solver_memory': solver_memory,
+                       'challenger_memory': challenger_memory})
+    next_state['selection_counts'] = dict(state['selection_counts'])
+    next_state['selection_counts'][name] += 1
+    candidate_text = json.dumps(candidate, sort_keys=True, ensure_ascii=False)
+    patch = source_diff(before, candidate)
+    record = {'run_id': state['run_id'], 'episode_id': number, 'benchmark': name,
+              'seeds': {'challenge': seed, 'challenger_model': seed, 'solver_model': seed + 500000},
+              'git_before': state['accepted_head'],
+              'challenger': {'request': challenge, 'rationale': rationale, 'invalid_proposals': invalid,
+                             'memory_before': state['challenger_memory'], 'memory_after': challenger_memory,
+                             'generation': challenger_gen},
+              'solver': {'response': response[:3 * 1024 * 1024], 'summary': summary,
+                         'candidate': candidate_text, 'patch': patch, 'files_changed': changed,
+                         'memory_before': state['solver_memory'], 'memory_after': solver_memory,
+                         'generation': solver_gen},
+              'reference_reads': reads,
+              'input_generation': {'generator': name + '-v1', 'seed': seed, 'config': challenge},
+              'build': result['build'], 'correctness': result['correctness'],
+              'performance': result['performance'],
+              'judge': {'feedback': result['feedback'], 'reward_inputs': result['reward_inputs'],
+                        'resource_usage': result.get('resource_usage',
+                                                     {'status': result['performance'].get('resource_status'),
+                                                      'memory_bytes': result['performance'].get('memory_bytes')}),
+                        'acceptance_reason': reason, 'baseline': baseline, 'replay': replay},
+              'rewards': {'solver': solver_reward, 'challenger': challenger_reward},
+              'outcome': 'accepted' if accepted else 'rejected', 'git_after': None,
+              'timestamps': {'started_at': result['started_at'], 'candidate_at': result['started_at'],
+                             'finished_at': result['finished_at']}}
+    digest = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()[:16]
+    commit_message = (f'feat(experiment): accept {name} episode {number}\n\n'
+                      f'Run: {state["run_id"]}\nChallenge: {str(challenge)[:250]}\n'
+                      f'Judge: {result["feedback"]}\nBaseline: {baseline["feedback"] if baseline else "none"}\n'
+                      f'Evidence SHA256 prefix: {digest}')
+    if len(json.dumps(record, ensure_ascii=False).encode()) > 20 * 1024 * 1024:
+        raise RuntimeError('episode evidence exceeds 20 MiB; incomplete attempt retained for recovery')
+    atomic_json(run_dir / 'pending.json', {'ready': True, 'episode_id': number,
+                                           'record': record, 'files': candidate,
+                                           'next_state': next_state, 'commit_message': commit_message})
+    next_state = reconcile(run_dir, state, workspace)
+    print(f'Episode {number} | {name}\nChallenger: {rationale}; {challenge}\n'
+          f'Solver: {summary or "invalid response"}; files {changed}; tokens {solver_gen.get("tokens", 0)}\n'
+          f'Judge: {result["feedback"]}; median {primary_ms(result)} ms; '
+          f'{reason}; {"ACCEPTED" if accepted else "REJECTED"}\n', flush=True)
+    return next_state
+
+
+def run(args, model=None):
+    from .experiment_model import offline_model
+    os.environ['HF_HUB_OFFLINE'] = '1'
+    os.environ['TRANSFORMERS_OFFLINE'] = '1'
+    if model is None:
+        model = offline_model()
+    names = args.benchmarks.split(',')
+    if not names or any(x not in TRAIN and x not in VALIDATION for x in names) or len(set(names)) != len(names):
+        raise ValueError('benchmarks must be distinct training or validation names; bosses are sealed')
+    run_dir = args.root.resolve() / args.run_id
+    config = SandboxConfig(cpus=args.cpus, memory_mb=args.memory_mb, pids=args.pids,
+                           tmpfs_mb=args.tmpfs_mb, timeout_seconds=args.timeout_seconds,
+                           output_bytes=min(args.output_bytes, 1024 * 1024))
+    state, workspace = prepare_run(run_dir, args.run_id, args.seed, model.revision, args.hours,
+                                   names, vars(args) | {'root': str(args.root)}, args.resume)
+    state = reconcile(run_dir, state, workspace)
+    soft, hard = int(args.soft_gb * 1024**3), int(args.hard_gb * 1024**3)
+    try:
+        while (args.episodes is None or state['episode'] < args.episodes) and (state['deadline'] is None or time.time() < state['deadline']):
+            size = storage_bytes(run_dir)
+            if size >= hard - 20 * 1024 * 1024:
+                print('Hard artifact quota reached; checkpointed.', flush=True)
+                break
+            if size >= soft:
+                for path in run_dir.rglob('*.tmp'):
+                    path.unlink(missing_ok=True)
+                if storage_bytes(run_dir) >= hard:
+                    break
+            state = episode(model, state, workspace, run_dir, config,
+                            args.challenger_tokens, args.solver_tokens)
+            if storage_bytes(run_dir) >= hard:
+                print('Hard artifact quota reached after episode; checkpointed.', flush=True)
+                break
+    finally:
+        safe_report(run_dir, state)
+    return state
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Offline autonomous arena experiment')
+    parser.add_argument('--run-id')
+    parser.add_argument('--preflight', action='store_true', help='verify cached model and offline Docker sandbox, then exit')
+    parser.add_argument('--root', type=Path, default=Path('trajectories/episodes'))
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--hours', type=float)
+    parser.add_argument('--episodes', type=int)
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--benchmarks', default=','.join(TRAIN))
+    parser.add_argument('--challenger-tokens', type=int, default=600)
+    parser.add_argument('--solver-tokens', type=int, default=2500)
+    parser.add_argument('--soft-gb', type=float, default=15)
+    parser.add_argument('--hard-gb', type=float, default=20)
+    parser.add_argument('--cpus', type=float, default=1)
+    parser.add_argument('--memory-mb', type=int, default=256)
+    parser.add_argument('--pids', type=int, default=64)
+    parser.add_argument('--tmpfs-mb', type=int, default=128)
+    parser.add_argument('--timeout-seconds', type=int, default=3)
+    parser.add_argument('--output-bytes', type=int, default=1024 * 1024)
+    args = parser.parse_args(argv)
+    if args.preflight:
+        from .experiment_model import offline_model
+        from .sandbox import run_c
+        session = offline_model()
+        check = run_c('int main(void){return 0;}')
+        if not check.compiled or check.exit_code != 0:
+            raise RuntimeError('local offline TinyCC sandbox preflight failed')
+        print(f'Offline model: {session.revision}; device: {next(session.model.parameters()).device}; '
+              f'context: {session.context_limit}; Docker/TinyCC: PASS; external candidate network: disabled')
+        return
+    if not args.run_id:
+        parser.error('--run-id is required for a run')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', args.run_id):
+        parser.error('--run-id must contain 1–80 letters, digits, underscores, or hyphens')
+    if not args.hours and not args.episodes:
+        parser.error('specify --hours or --episodes')
+    if args.hours is not None and args.hours <= 0 or args.episodes is not None and args.episodes <= 0:
+        parser.error('duration and episode count must be positive')
+    if not 0 < args.soft_gb < args.hard_gb or args.hard_gb > 20:
+        parser.error('invalid soft/hard quota')
+    run(args)
+
+
+if __name__ == '__main__':
+    main()
