@@ -40,11 +40,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true",
         help="Print the full evaluation result as JSON instead of a summary.",
     )
+    solve = sub.add_parser("solve", help="Run the LLM Solver retry loop on a task.")
+    solve.add_argument("task", type=Path, help="Path to a task JSON file.")
+    solve.add_argument(
+        "--attempts", type=int, default=3,
+        help="Maximum number of generation attempts (default: 3).",
+    )
+    solve.add_argument(
+        "--log", type=Path, default=None,
+        help="Append every attempt to this JSONL trajectory file.",
+    )
+    solve.add_argument(
+        "--model", default=None,
+        help="HuggingFace model id (default: HuggingFaceTB/SmolLM2-360M-Instruct).",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "solve":
+        return _cmd_solve(args)
     if args.attempt < 1:
         print("error: --attempt must be >= 1", file=sys.stderr)
         return 2
@@ -61,6 +77,29 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(asdict(result), indent=2))
     else:
         print(summary(task, result))
+    return 0 if result.success else 1
+
+
+def _cmd_solve(args) -> int:
+    task = load_task(args.task)
+    from .solver import solve
+    from .solver_llm import llm_generate, load_model
+
+    if args.model is None:
+        model, tokenizer = load_model()
+    else:
+        model, tokenizer = load_model(args.model)
+    result = solve(
+        task,
+        lambda messages: llm_generate(model, tokenizer, messages),
+        max_attempts=args.attempts,
+        log_path=args.log,
+    )
+    print(f"task:     {task['id']} - {task['title']}")
+    print(f"success:  {'yes' if result.success else 'no'}  after {result.attempts} attempt(s)")
+    print(f"rewards:  {result.rewards}")
+    if result.log_path:
+        print(f"log:      {result.log_path}")
     return 0 if result.success else 1
 
 
