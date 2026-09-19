@@ -1,12 +1,18 @@
 # Agent Arena
 
-The future generic benchmark and sandbox contracts are in
+The current offline Challenger/Solver experiment runner, exact launch and
+resume commands, Docker-only Judge path, acceptance rules, and limitations are
+in [docs/EXPERIMENT.md](docs/EXPERIMENT.md). Generic contracts are in
 [docs/arena.md](docs/arena.md) and [docs/evidence.md](docs/evidence.md).
-The existing CLI paths below remain the original small C-task prototype;
-they are not yet connected to the new Docker runner.
-The current benchmark suite, evaluator method, and remaining gaps are in
-[docs/research.md](docs/research.md). The read-only local viewer is documented
-in [docs/viewer.md](docs/viewer.md).
+The benchmark suite and research method are in [docs/research.md](docs/research.md).
+The read-only local viewer is documented in [docs/viewer.md](docs/viewer.md).
+
+The `arena run`, `arena solve`, and `arena marl` commands described below are
+the older three-task prototype. They use a host TCC judge and must not be used
+for agent-generated candidates in the new experiment. Use `arena experiment`
+for the offline Docker/TinyCC path. SmolLM2 weights remain frozen.
+
+## Legacy three-task prototype
 
 A minimal autonomous C-programming environment where a small language model
 generates C programs, receives deterministic compiler/test feedback and
@@ -87,8 +93,7 @@ Reward
 - **Hugging Face SmolLM2-360M-Instruct integration** (`arena/solver_llm.py`,
   optional dependency): CPU-inference adapter, chat-template based, hidden
   tests never shown to the model.
-- **Automated tests**: `unittest` suite (61 tests) exercising the arena with
-  the real TCC binary.
+- **Automated tests**: `unittest` suite exercising the arena with TCC.
 
 ## Not implemented / future work
 

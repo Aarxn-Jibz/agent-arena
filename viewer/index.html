@@ -41,7 +41,7 @@ async function selectEpisode(id) {
   show('solverBefore', e.solver?.memory_before || []); show('solverAfter', e.solver?.memory_after || []);
   show('response', e.solver?.response); show('references', e.reference_reads || []); show('candidate', e.solver?.candidate); show('diff', e.source_diff);
   show('build', e.build); show('correctness', e.correctness); show('performance', e.performance);
-  show('resources', e.judge?.resource_usage); show('verdict', {feedback: e.judge?.feedback, reward_inputs: e.judge?.reward_inputs, rewards: e.rewards, outcome: e.outcome});
+  show('resources', e.judge?.resource_usage); show('verdict', {feedback: e.judge?.feedback, reward_inputs: e.judge?.reward_inputs, rewards: e.rewards, policy: e.selection_policy && {mode: e.selection_policy.mode, state: e.selection_policy.state, action: e.selection_policy.action, frontier_reward: e.selection_policy.frontier_reward}, outcome: e.outcome});
 }
 async function refresh() {
   try {

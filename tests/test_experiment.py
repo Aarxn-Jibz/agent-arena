@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import subprocess
 import tempfile
 import unittest
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from arena import experiment
-from arena.experiment_context import apply_changes
+from arena.experiment_context import apply_changes, lexical_search, parse_solver_response, read_range
 from arena.sandbox import SandboxConfig
 
 
@@ -49,6 +50,28 @@ class FakeModel:
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_model_delta_validation_and_invalid_solver_evidence(self):
+        class Toy:
+            def initialize(self, seed):
+                return {'seed': seed, 'size': 1}
+            def validate_challenge(self, value):
+                return (value.get('seed') == 7 and value.get('size') in (1, 2, 3), 'invalid')
+        class Reply:
+            def __init__(self, text):
+                self.text = text
+            def generate(self, *args, **kwargs):
+                return {'text': self.text, 'tokens': 12, 'truncated': False}
+        challenge, rationale, invalid, _ = experiment.choose_challenge(
+            Reply('{"parameters":{"size":2},"rationale":"probe range"}'), Toy(), 'Public spec',
+            7, [], [], 50)
+        self.assertEqual(challenge, {'seed': 7, 'size': 2})
+        self.assertEqual(rationale, 'probe range')
+        self.assertFalse(invalid)
+        source, changed, _, raw, _, generation = experiment.solve(
+            Reply('unstructured failure'), 'Public spec', challenge, {}, [], '', '', 9, 50)
+        self.assertEqual((source, changed, raw), ({}, [], 'unstructured failure'))
+        self.assertIn('error', generation)
+
     def test_safe_paths_and_bounded_memory(self):
         with self.assertRaises(ValueError):
             apply_changes({'solution.c': ''}, {'changes': [{'path': '../escape.c', 'content': ''}]})
@@ -56,12 +79,26 @@ class ExperimentTests(unittest.TestCase):
         for i in range(8):
             memory = experiment.push_memory(memory, str(i))
         self.assertEqual(memory, ['3', '4', '5', '6', '7'])
+        self.assertEqual(parse_solver_response('```c\nint main(void){return 0;}\n```')['changes'][0]['path'],
+                         'solution.c')
+        self.assertEqual(read_range({'solution.c': 'a\nb\nc\n'}, 'solution.c', 2, 1), 'b\n')
+        self.assertEqual(lexical_search({'solution.c': 'a\nneedle\n'}, {'needle'})[0][2], 2)
 
     def test_acceptance_noise_floor(self):
         self.assertEqual(experiment.accept({'accepted': True, 'performance': {'median_ms': 94}},
                                            {'accepted': True, 'performance': {'median_ms': 100}})[0], False)
         self.assertEqual(experiment.accept({'accepted': True, 'performance': {'median_ms': 80}},
                                            {'accepted': True, 'performance': {'median_ms': 100}})[0], True)
+
+    def test_adaptive_selection_rng_survives_json_checkpoint(self):
+        state = {'selection_mode': 'adaptive', 'benchmarks': ['compression', 'csv'],
+                 'episode': 0, 'Q_challenger': experiment.init_q(['compression', 'csv']),
+                 'performance_history': [], 'policy_rng_state': random.Random(42).getstate(),
+                 'epsilon': .3}
+        first = experiment.select_benchmark(state)
+        state['policy_rng_state'] = first[2]
+        restored = json.loads(json.dumps(state))
+        self.assertEqual(experiment.select_benchmark(state), experiment.select_benchmark(restored))
 
     def test_resume_and_evidence(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -79,6 +116,7 @@ class ExperimentTests(unittest.TestCase):
             spec.write_text('Return zero. Specify candidate code.')
             args = SimpleNamespace(root=root / 'runs', run_id='test_run', seed=5, hours=None,
                                    episodes=1, resume=False, benchmarks='compression', cpus=1,
+                                   selection_mode='round_robin',
                                    memory_mb=256, pids=64, tmpfs_mb=128, timeout_seconds=3,
                                    output_bytes=65536, soft_gb=.1, hard_gb=.2,
                                    challenger_tokens=100, solver_tokens=200)
@@ -123,6 +161,14 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(recovered['episode'], 3)
                 self.assertEqual(json.loads((run_dir / '000003.json').read_text())['git_after'],
                                  recovered['accepted_head'])
+                self.assertGreater(experiment.run_bytes(run_dir, recovered, workspace),
+                                   experiment.storage_bytes(run_dir))
+                args.run_id, args.resume, args.episodes, args.selection_mode = 'adaptive_run', False, 1, 'adaptive'
+                adaptive = experiment.run(args, FakeModel())
+                self.assertEqual(adaptive['episode'], 1)
+                adaptive_record = json.loads((args.root / args.run_id / '000001.json').read_text())
+                self.assertEqual(adaptive_record['selection_policy']['mode'], 'adaptive')
+                self.assertIn('Q_challenger', adaptive)
 
 
 if __name__ == '__main__':

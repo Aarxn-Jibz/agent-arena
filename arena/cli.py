@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Evaluate C source against a task using TCC, deterministically.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("experiment", help="Run the offline Docker-only autonomous experiment.")
     run = sub.add_parser("run", help="Evaluate a C file against a task.")
     run.add_argument("task", type=Path, help="Path to a task JSON file.")
     run.add_argument("source", type=Path, help="Path to the C source file.")

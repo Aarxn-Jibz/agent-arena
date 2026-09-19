@@ -11,6 +11,22 @@ MAX_SOURCE_BYTES = 3 * 1024 * 1024
 PATH = re.compile(r'(?:solution|src/[A-Za-z0-9_-]+)\.(?:c|h)\Z')
 
 
+def read_range(files: dict[str, str], path: str, start: int, count: int = 40) -> str:
+    if path not in files or not PATH.fullmatch(path) or start < 1 or not 1 <= count <= 80:
+        raise ValueError('invalid source read')
+    return ''.join(files[path].splitlines(keepends=True)[start - 1:start - 1 + count])
+
+
+def lexical_search(files: dict[str, str], terms: set[str], limit: int = 20):
+    matches = []
+    for path in sorted(files):
+        for number, line in enumerate(files[path].splitlines(), 1):
+            score = sum(term in line.lower() for term in terms)
+            if score:
+                matches.append((score, path, number))
+    return sorted(matches, key=lambda x: (-x[0], x[1], x[2]))[:limit]
+
+
 def parse_object(text: str) -> dict:
     start, end = text.find('{'), text.rfind('}')
     if start < 0 or end < start:
@@ -19,6 +35,17 @@ def parse_object(text: str) -> dict:
     if not isinstance(value, dict):
         raise ValueError('response must be an object')
     return value
+
+
+def parse_solver_response(text: str) -> dict:
+    try:
+        return parse_object(text)
+    except ValueError:
+        match = re.search(r'```(?:c|C)\s*\n(.*?)\n```', text, re.DOTALL)
+        if match:
+            return {'summary': 'C source response',
+                    'changes': [{'path': 'solution.c', 'content': match.group(1)}]}
+        raise
 
 
 def apply_changes(files: dict[str, str], response: dict) -> tuple[dict[str, str], list[str]]:
@@ -51,16 +78,20 @@ def selected_context(files: dict[str, str], challenge: dict, latest_diff: str = 
                      reference_root: Path | None = None, max_chars: int = 12000):
     """Deterministic lexical selection; selected reads are recorded by caller."""
     terms = set(re.findall(r'[A-Za-z_][A-Za-z_0-9]{3,}', json.dumps(challenge).lower()))
-    ranked = sorted(files, key=lambda p: (-sum(t in files[p].lower() for t in terms), p))
+    hits = lexical_search(files, terms)
+    ranked = sorted(files, key=lambda p: (-sum(hit[1] == p for hit in hits), p))
     sections = ['Source files: ' + ', '.join(sorted(files))]
     reads = []
     for path in ranked:
         room = max_chars - sum(map(len, sections))
         if room < 400:
             break
-        content = files[path][:min(room - 100, 6000)]
-        sections.append(f'\nFILE {path} lines 1–{len(content.splitlines())}:\n{content}')
-        reads.append({'document': path, 'section': f'lines 1–{len(content.splitlines())}',
+        hit = next((number for _, found, number in hits if found == path), 1)
+        start = max(1, hit - 12)
+        content = read_range(files, path, start, 40)[:min(room - 100, 6000)]
+        end = start + len(content.splitlines()) - 1
+        sections.append(f'\nFILE {path} lines {start}–{end}:\n{content}')
+        reads.append({'document': path, 'section': f'lines {start}–{end}',
                       'read_at': datetime.now(timezone.utc).isoformat()})
     if latest_diff:
         sections.append('\nLatest accepted diff:\n' + latest_diff[:1500])

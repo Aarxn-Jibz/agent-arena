@@ -46,7 +46,8 @@ def viewer_events(record: dict) -> list[dict]:
          "performance": record["performance"],
          "resource_usage": record["judge"].get("resource_usage", {}),
          "feedback": record["judge"]["feedback"],
-         "rewards": record["rewards"], "outcome": record["outcome"]},
+         "rewards": record["rewards"], "selection_policy": record.get("selection_policy"),
+         "outcome": record["outcome"]},
     ]
 
 

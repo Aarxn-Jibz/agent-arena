@@ -10,16 +10,13 @@ from .solver_llm import MODEL_ID
 def offline_model(revision: str | None = None):
     os.environ['HF_HUB_OFFLINE'] = '1'
     os.environ['TRANSFORMERS_OFFLINE'] = '1'
+    from huggingface_hub import snapshot_download
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    options = {'local_files_only': True}
-    if revision:
-        options['revision'] = revision
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, **options)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, **options)
+    snapshot = Path(snapshot_download(MODEL_ID, revision=revision, local_files_only=True))
+    tokenizer = AutoTokenizer.from_pretrained(snapshot, local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(snapshot, local_files_only=True)
     model.eval()
-    cache = Path.home() / '.cache/huggingface/hub' / ('models--' + MODEL_ID.replace('/', '--')) / 'refs/main'
-    resolved = cache.read_text().strip() if cache.exists() else (revision or 'unknown')
-    return ModelSession(model, tokenizer, resolved)
+    return ModelSession(model, tokenizer, snapshot.name)
 
 
 class ModelSession:
@@ -35,7 +32,7 @@ class ModelSession:
         messages = [dict(item) for item in messages]
         for _ in range(8):
             ids = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors='pt')
-            if isinstance(ids, dict):
+            if not isinstance(ids, torch.Tensor):
                 ids = ids['input_ids']
             excess = ids.shape[1] + max_new_tokens - self.context_limit
             if excess <= 0:
@@ -52,10 +49,10 @@ class ModelSession:
                                tok.decode(content_ids[-(keep-front):]))
         else:
             raise ValueError('context accounting failed to converge')
-        generator = torch.Generator(device='cpu').manual_seed(seed)
-        with torch.inference_mode():
+        with torch.random.fork_rng(devices=[]), torch.inference_mode():
+            torch.manual_seed(seed)
             output = self.model.generate(ids, max_new_tokens=max_new_tokens, do_sample=True,
-                                         temperature=0.8, top_p=0.9, generator=generator,
+                                         temperature=0.8, top_p=0.9,
                                          pad_token_id=tok.pad_token_id or tok.eos_token_id)
         new = output[0, ids.shape[1]:]
         eos = tok.eos_token_id

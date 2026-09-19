@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import random
 import re
-import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -20,8 +20,9 @@ from .graph_benchmark import GraphBenchmark
 from .http_benchmark import HttpBenchmark
 from .secondary import CacheBenchmark, LogBenchmark, SearchBenchmark
 from .evidence import viewer_events, write_episode
-from .experiment_context import apply_changes, parse_object, selected_context, source_diff
+from .experiment_context import apply_changes, parse_object, parse_solver_response, selected_context, source_diff
 from .sandbox import SandboxConfig
+from .marl import choose_action, init_q, q_update, rolling_average, skill_state, challenger_reward as frontier_reward
 
 TRAIN = {'compression': CompressionBenchmark, 'csv': CsvBenchmark, 'http': HttpBenchmark,
          'expression': ExpressionBenchmark, 'graph': GraphBenchmark}
@@ -57,6 +58,20 @@ def push_memory(items: list[str], note: str, limit=600):
     return (items + [memory_note(note, limit)])[-5:]
 
 
+def _tuple_tree(value):
+    return tuple(_tuple_tree(x) for x in value) if isinstance(value, list) else value
+
+
+def select_benchmark(state: dict):
+    if state['selection_mode'] == 'round_robin':
+        return state['benchmarks'][state['episode'] % len(state['benchmarks'])], None, None
+    rng = random.Random()
+    rng.setstate(_tuple_tree(state['policy_rng_state']))
+    performance_state = skill_state(rolling_average(state['performance_history']))
+    name = choose_action(state['Q_challenger'][performance_state], state['epsilon'], rng)
+    return name, performance_state, rng.getstate()
+
+
 def project_files(workspace: Path, benchmark: str):
     root = workspace / 'solutions' / benchmark
     return {str(path.relative_to(root)): path.read_text() for path in sorted(root.rglob('*'))
@@ -79,19 +94,51 @@ def storage_bytes(path: Path):
     return sum(p.stat().st_size for p in path.rglob('*') if p.is_file() and not p.is_symlink()) if path.exists() else 0
 
 
+def run_bytes(run_dir: Path, state: dict, workspace: Path):
+    total = storage_bytes(run_dir)
+    base = state.get('base_head', state['accepted_head'])
+    objects = git('rev-list', '--objects', 'HEAD', '^' + base, cwd=workspace)
+    if objects:
+        ids = [line.split()[0] for line in objects.splitlines()]
+        process = subprocess.run(['git', 'cat-file', '--batch-check=%(objectsize)'],
+                                 cwd=workspace, input='\n'.join(ids) + '\n',
+                                 text=True, capture_output=True, check=True)
+        total += sum(int(line) for line in process.stdout.splitlines())
+    return total
+
+
 def safe_report(run_dir: Path, state: dict):
     lines = [f'# Experiment {state["run_id"]}', '', f'- Episodes: {state["episode"]}',
              f'- Started: {state["started_at"]}', f'- Deadline: {state.get("deadline")}',
+             f'- Seed: {state["seed"]}', f'- Benchmarks: {", ".join(state["benchmarks"])}',
+             f'- Selection: {state.get("selection_mode", "round_robin")}; counts {state["selection_counts"]}',
+             f'- Token budgets: Challenger {state["config"]["challenger_tokens"]}, Solver {state["config"]["solver_tokens"]}',
+             f'- Run quota: soft {state["config"]["soft_gb"]} GiB, hard {state["config"]["hard_gb"]} GiB',
              f'- Accepted Git HEAD: {state["accepted_head"]}',
              f'- Model: {state["model_id"]} @ {state["model_revision"]}',
              f'- Frozen model weights: yes', '', '## Outcomes', '']
+    records = []
     for path in sorted(run_dir.glob('[0-9]*.json')):
         try:
             item = json.loads(path.read_text())
+            records.append(item)
             lines.append(f'- {item["episode_id"]} {item["benchmark"]}: {item["outcome"]}; '
                          f'{item["judge"]["feedback"]}; Git {item["git_after"] or "unchanged"}')
         except (ValueError, KeyError):
             pass
+    if records:
+        lines += ['', '## Aggregate', '',
+                  f'- Accepted: {sum(x["outcome"] == "accepted" for x in records)}/{len(records)}',
+                  f'- Average Solver reward: {sum(x["rewards"]["solver"] for x in records)/len(records):.3f}',
+                  f'- Average Challenger reward: {sum(x["rewards"]["challenger"] for x in records)/len(records):.3f}',
+                  '- These are local Judge outcomes, not a held-out improvement claim.']
+    if state.get('selection_mode') == 'adaptive':
+        lines += ['', '## Learned benchmark policy', '',
+                  'The Q table estimates the usefulness of benchmark selection by recent pass-rate state.',
+                  'It is a surrounding selection policy; SmolLM2 weights are frozen.', '']
+        for level, row in state['Q_challenger'].items():
+            preferred = max(row, key=row.get)
+            lines.append(f'- {level}: {preferred} (Q={row[preferred]:.3f})')
     path = run_dir / 'report.md'
     tmp = path.with_suffix('.tmp')
     tmp.write_text('\n'.join(lines) + '\n')
@@ -110,11 +157,6 @@ def rebuild_events(run_dir: Path):
     temp = target.with_suffix('.tmp')
     temp.write_text('\n'.join(lines) + ('\n' if lines else ''))
     os.replace(temp, target)
-
-
-def score(evaluation: dict):
-    c = evaluation['correctness']
-    return c['passed'] / max(1, c['total'])
 
 
 def primary_ms(evaluation: dict):
@@ -173,10 +215,18 @@ def prepare_run(run_dir: Path, run_id: str, seed: int, model_revision: str, hour
     workspace = run_dir / 'workspace'
     if resume:
         state = json.loads(state_path.read_text())
+        state.setdefault('selection_mode', 'round_robin')
+        state.setdefault('Q_challenger', init_q(benchmarks))
+        state.setdefault('performance_history', [])
+        state.setdefault('policy_rng_state', random.Random(seed).getstate())
+        state.setdefault('alpha', .4)
+        state.setdefault('gamma', .8)
+        state.setdefault('epsilon', .3)
+        state['config'].setdefault('selection_mode', 'round_robin')
         if (state['run_id'] != run_id or state['seed'] != seed or state['benchmarks'] != benchmarks
                 or state['model_revision'] != model_revision):
             raise ValueError('resume configuration differs from checkpoint')
-        for key in ('challenger_tokens', 'solver_tokens', 'cpus', 'memory_mb', 'pids',
+        for key in ('selection_mode', 'challenger_tokens', 'solver_tokens', 'cpus', 'memory_mb', 'pids',
                     'tmpfs_mb', 'timeout_seconds', 'output_bytes', 'soft_gb', 'hard_gb'):
             if state['config'][key] != config[key]:
                 raise ValueError(f'resume {key} differs from checkpoint')
@@ -188,12 +238,17 @@ def prepare_run(run_dir: Path, run_id: str, seed: int, model_revision: str, hour
     git('worktree', 'add', '-b', branch, str(workspace), 'HEAD')
     head = git('rev-parse', 'HEAD', cwd=workspace)
     started = time.time()
+    policy_rng = random.Random(seed)
     state = {'run_id': run_id, 'seed': seed, 'episode': 0, 'started_at': now(),
              'deadline': started + hours * 3600 if hours else None,
              'benchmarks': benchmarks, 'model_id': 'HuggingFaceTB/SmolLM2-360M-Instruct',
              'model_revision': model_revision, 'config': config, 'branch': branch,
-             'accepted_head': head, 'challenger_memory': [], 'solver_memory': [],
-             'selection_counts': {name: 0 for name in benchmarks}}
+             'accepted_head': head, 'base_head': head,
+             'challenger_memory': [], 'solver_memory': [],
+             'selection_counts': {name: 0 for name in benchmarks},
+             'selection_mode': config['selection_mode'], 'Q_challenger': init_q(benchmarks),
+             'performance_history': [], 'policy_rng_state': policy_rng.getstate(),
+             'alpha': .4, 'gamma': .8, 'epsilon': .3}
     atomic_json(state_path, state)
     atomic_json(run_dir / 'manifest.json', state)
     return state, workspace
@@ -244,13 +299,16 @@ def reconcile(run_dir: Path, state: dict, workspace: Path):
 def choose_challenge(model, benchmark, public_spec: str, seed: int, memory: list[str],
                      recent: list[dict], max_tokens: int):
     schema = benchmark.initialize(seed)
-    system = ('You are Challenger. Propose a valid benchmark challenge, not a solution. '
-              'Return ONLY JSON: {"challenge": {...}, "rationale": "..."}. '
-              'Keep rationale under 100 words. Do not suggest implementation.')
-    prompt = (f'Public specification:\n{public_spec[:6000]}\nAllowed challenge fields and starting values: '
-              f'{json.dumps(schema)}\nThe seed MUST be {seed}. Respect documented bounds.\n'
-              f'Judge outcomes: {json.dumps(recent[-3:])[:1500]}\n'
-              f'Your last five interpretations (may be wrong): {json.dumps(memory[-5:])}')
+    example_key = next(key for key in schema if key != 'seed')
+    system = ('You are Challenger. Choose valid test parameters, never implementation ideas. '
+              'Output a short JSON object only.')
+    prompt = (f'Public specification:\n{public_spec[:3000]}\n'
+              f'Recent objective Judge outcomes: {json.dumps(recent[-3:])[:800]}\n'
+              f'Your last five interpretations (may be wrong): {json.dumps(memory[-5:])[:800]}\n'
+              f'Default parameters: {json.dumps(schema)}. The seed is fixed to {seed}.\n'
+              'Choose one or more non-seed fields to vary within the public bounds. '
+              f'Return ONLY JSON like {json.dumps({"parameters": {example_key: schema[example_key]}, "rationale": "probe a weakness"})}. '
+              'Include only fields you change. No Markdown.')
     attempts = []
     for retry in range(2):
         generated = model.generate([{'role': 'system', 'content': system},
@@ -258,7 +316,10 @@ def choose_challenge(model, benchmark, public_spec: str, seed: int, memory: list
                                    seed=seed + retry, max_new_tokens=max_tokens)
         try:
             data = parse_object(generated['text'])
-            challenge = data['challenge']
+            if isinstance(data.get('parameters'), dict):
+                challenge = schema | data['parameters']
+            else:
+                challenge = data.get('challenge', data)
             valid, reason = benchmark.validate_challenge(challenge)
             if valid and challenge.get('seed') == seed:
                 return challenge, memory_note(data.get('rationale', ''), 500), attempts, generated
@@ -271,34 +332,49 @@ def choose_challenge(model, benchmark, public_spec: str, seed: int, memory: list
 def solve(model, public_spec: str, challenge: dict, files: dict[str, str], memory: list[str],
           latest_diff: str, failures: str, seed: int, max_tokens: int):
     context, reads = selected_context(files, challenge, latest_diff, failures, ROOT / 'references')
-    system = ('You are Solver. Write C for TinyCC. Return ONLY JSON '
-              '{"summary":"very short approach", "changes":[{"path":"solution.c", "content":"full replacement C text"}]}. '
-              'Modify only changed files. Allowed paths: solution.c or src/<safe-name>.c/.h. '
-              'No external libraries or network. You may choose any implementation strategy.')
-    user = (f'Public specification:\n{public_spec[:5500]}\nValidated challenge:\n{json.dumps(challenge)}\n'
-            f'Accepted source context:\n{context}\nYour last five interpretations (may be wrong): '
-            f'{json.dumps(memory[-5:])}')
+    system = ('You are a C programmer. Produce candidate source for TinyCC. '
+              'No external libraries or network. Choose your own implementation.')
+    user = (f'Public specification:\n{public_spec[:5500]}\n'
+            f'Accepted source context:\n{context}\n'
+            f'Previous Judge feedback: {failures[:800]}\n'
+            f'Your last five notes (may be wrong): {json.dumps(memory[-5:])[:1000]}\n\n'
+            f'Now solve this validated challenge: {json.dumps(challenge)}\n'
+            'Reply with changed files as JSON: {"summary":"short decision",'
+            '"changes":[{"path":"solution.c","content":"complete C source"}]}. '
+            'If JSON escaping is difficult, reply with just one ```c fenced solution.c instead. '
+            'Do not discuss the specification.')
     messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
     generated = model.generate(messages, seed=seed, max_new_tokens=max_tokens)
     text = generated['text']
     try:
-        parsed = parse_object(text)
-    except ValueError:
+        parsed = parse_solver_response(text)
+    except ValueError as first_error:
         if generated['truncated']:
-            continuation = model.generate(messages + [{'role': 'assistant', 'content': text},
-                                                      {'role': 'user', 'content': 'Continue the same JSON response only.'}],
-                                          seed=seed + 1, max_new_tokens=min(max_tokens, 1000))
-            text += continuation['text']
-            generated['continuation_tokens'] = continuation['tokens']
-        parsed = parse_object(text)
-    updated, changed = apply_changes(files, parsed)
+            try:
+                continuation = model.generate(messages + [{'role': 'assistant', 'content': text},
+                                                          {'role': 'user', 'content': 'Continue the same JSON response only.'}],
+                                              seed=seed + 1, max_new_tokens=min(max_tokens, 1000))
+                text += continuation['text']
+                generated['continuation_tokens'] = continuation['tokens']
+            except ValueError as err:
+                generated['continuation_error'] = str(err)
+        try:
+            parsed = parse_solver_response(text)
+        except ValueError:
+            generated['error'] = str(first_error)
+            return files, [], '', text, reads, generated
+    try:
+        updated, changed = apply_changes(files, parsed)
+    except (ValueError, KeyError, TypeError) as err:
+        generated['error'] = str(err)
+        return files, [], '', text, reads, generated
     return updated, changed, memory_note(parsed.get('summary', ''), 500), text, reads, generated
 
 
 def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxConfig,
             challenger_tokens: int, solver_tokens: int):
     number = state['episode'] + 1
-    name = state['benchmarks'][(number - 1) % len(state['benchmarks'])]
+    name, performance_state, next_rng_state = select_benchmark(state)
     benchmark = TRAIN.get(name, VALIDATION.get(name))()
     seed = (state['seed'] + number * 1009) % (2**32)
     spec = (ROOT / 'docs/benchmarks' / name / 'SPEC.md').read_text()
@@ -306,7 +382,9 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
     for path in sorted(run_dir.glob('[0-9]*.json'))[-3:]:
         item = json.loads(path.read_text())
         recent.append({'benchmark': item['benchmark'], 'feedback': item['judge']['feedback'],
-                       'outcome': item['outcome']})
+                       'outcome': item['outcome'], 'correctness': item['correctness']['passed'],
+                       'total': item['correctness']['total'],
+                       'performance': primary_ms(item)})
     challenge, rationale, invalid, challenger_gen = choose_challenge(
         model, benchmark, spec, seed, state['challenger_memory'], recent, challenger_tokens)
     atomic_json(run_dir / 'pending.json', {'ready': False, 'episode_id': number,
@@ -323,7 +401,8 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
                                                'challenge': challenge, 'rationale': rationale,
                                                'solver_response': response[:3 * 1024 * 1024],
                                                'candidate': candidate})
-        result = benchmark.evaluate(candidate, challenge, config)
+        result = (synthetic_failure(benchmark, challenge, 'Invalid Solver response: ' + solver_gen['error'])
+                  if solver_gen.get('error') else benchmark.evaluate(candidate, challenge, config))
     except (ValueError, KeyError, TypeError, RuntimeError, TimeoutError) as err:
         candidate, changed, summary, response, reads, solver_gen = before, [], '', str(err), [], {}
         result = synthetic_failure(benchmark, challenge, f'Invalid Solver response: {err}')
@@ -366,6 +445,17 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
                        'challenger_memory': challenger_memory})
     next_state['selection_counts'] = dict(state['selection_counts'])
     next_state['selection_counts'][name] += 1
+    policy_reward = frontier_reward(result['correctness']['passed'] / max(1, result['correctness']['total']))
+    if not changed:
+        policy_reward = 0.0
+    next_state['performance_history'] = (state['performance_history'] +
+                                         [result['correctness']['passed'] / max(1, result['correctness']['total'])])[-3:]
+    if performance_state is not None:
+        next_state['Q_challenger'] = {key: dict(row) for key, row in state['Q_challenger'].items()}
+        next_state['policy_rng_state'] = next_rng_state
+        next_performance_state = skill_state(rolling_average(next_state['performance_history']))
+        q_update(next_state['Q_challenger'], performance_state, name, policy_reward,
+                 next_performance_state, state['alpha'], state['gamma'])
     candidate_text = json.dumps(candidate, sort_keys=True, ensure_ascii=False)
     patch = source_diff(before, candidate)
     record = {'run_id': state['run_id'], 'episode_id': number, 'benchmark': name,
@@ -379,6 +469,10 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
                          'memory_before': state['solver_memory'], 'memory_after': solver_memory,
                          'generation': solver_gen},
               'reference_reads': reads,
+              'selection_policy': {'mode': state['selection_mode'], 'state': performance_state,
+                                   'action': name, 'frontier_reward': policy_reward,
+                                   'q_before': state['Q_challenger'],
+                                   'q_after': next_state['Q_challenger']},
               'input_generation': {'generator': name + '-v1', 'seed': seed, 'config': challenge},
               'build': result['build'], 'correctness': result['correctness'],
               'performance': result['performance'],
@@ -395,7 +489,8 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
     commit_message = (f'feat(experiment): accept {name} episode {number}\n\n'
                       f'Run: {state["run_id"]}\nChallenge: {str(challenge)[:250]}\n'
                       f'Judge: {result["feedback"]}\nBaseline: {baseline["feedback"] if baseline else "none"}\n'
-                      f'Evidence SHA256 prefix: {digest}')
+                      f'Evidence: {run_dir / f"{number:06d}.json"}\n'
+                      f'Precommit record SHA256 prefix: {digest}')
     if len(json.dumps(record, ensure_ascii=False).encode()) > 20 * 1024 * 1024:
         raise RuntimeError('episode evidence exceeds 20 MiB; incomplete attempt retained for recovery')
     atomic_json(run_dir / 'pending.json', {'ready': True, 'episode_id': number,
@@ -410,15 +505,26 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
 
 
 def run(args, model=None):
+    args.root.mkdir(parents=True, exist_ok=True)
+    with (args.root / (args.run_id + '.lock')).open('w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as err:
+            raise RuntimeError('experiment run is already active') from err
+        return _run_locked(args, model)
+
+
+def _run_locked(args, model=None):
     from .experiment_model import offline_model
     os.environ['HF_HUB_OFFLINE'] = '1'
     os.environ['TRANSFORMERS_OFFLINE'] = '1'
-    if model is None:
-        model = offline_model()
     names = args.benchmarks.split(',')
     if not names or any(x not in TRAIN and x not in VALIDATION for x in names) or len(set(names)) != len(names):
         raise ValueError('benchmarks must be distinct training or validation names; bosses are sealed')
     run_dir = args.root.resolve() / args.run_id
+    if model is None:
+        revision = json.loads((run_dir / 'state.json').read_text())['model_revision'] if args.resume else None
+        model = offline_model(revision)
     config = SandboxConfig(cpus=args.cpus, memory_mb=args.memory_mb, pids=args.pids,
                            tmpfs_mb=args.tmpfs_mb, timeout_seconds=args.timeout_seconds,
                            output_bytes=min(args.output_bytes, 1024 * 1024))
@@ -428,18 +534,18 @@ def run(args, model=None):
     soft, hard = int(args.soft_gb * 1024**3), int(args.hard_gb * 1024**3)
     try:
         while (args.episodes is None or state['episode'] < args.episodes) and (state['deadline'] is None or time.time() < state['deadline']):
-            size = storage_bytes(run_dir)
-            if size >= hard - 20 * 1024 * 1024:
+            size = run_bytes(run_dir, state, workspace)
+            if size >= hard - 64 * 1024 * 1024:
                 print('Hard artifact quota reached; checkpointed.', flush=True)
                 break
             if size >= soft:
                 for path in run_dir.rglob('*.tmp'):
                     path.unlink(missing_ok=True)
-                if storage_bytes(run_dir) >= hard:
+                if run_bytes(run_dir, state, workspace) >= hard:
                     break
             state = episode(model, state, workspace, run_dir, config,
                             args.challenger_tokens, args.solver_tokens)
-            if storage_bytes(run_dir) >= hard:
+            if run_bytes(run_dir, state, workspace) >= hard:
                 print('Hard artifact quota reached after episode; checkpointed.', flush=True)
                 break
     finally:
@@ -457,6 +563,7 @@ def main(argv=None):
     parser.add_argument('--episodes', type=int)
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--benchmarks', default=','.join(TRAIN))
+    parser.add_argument('--selection-mode', choices=('adaptive', 'round_robin'), default='adaptive')
     parser.add_argument('--challenger-tokens', type=int, default=600)
     parser.add_argument('--solver-tokens', type=int, default=2500)
     parser.add_argument('--soft-gb', type=float, default=15)
