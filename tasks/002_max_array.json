@@ -1,0 +1,13 @@
+{
+  "id": "002",
+  "title": "Maximum element of an array",
+  "prompt": "First read integer N, then read N integers. Print the maximum of the N integers.",
+  "timeout_seconds": 2,
+  "tests": [
+    {"input": "3\n1 2 3\n", "expected_output": "3\n"},
+    {"input": "5\n-4 -9 0 3 -1\n", "expected_output": "3\n"},
+    {"input": "1\n42\n", "expected_output": "42\n"},
+    {"input": "4\n-7 -2 -10 -3\n", "expected_output": "-2\n"},
+    {"input": "6\n10 20 30 20 10 5\n", "expected_output": "30\n"}
+  ]
+}

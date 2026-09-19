@@ -1,0 +1,12 @@
+{
+  "id": "003",
+  "title": "Reverse a string",
+  "prompt": "Read a single word (no spaces) and print it reversed.",
+  "timeout_seconds": 2,
+  "tests": [
+    {"input": "hello\n", "expected_output": "olleh\n"},
+    {"input": "racecar\n", "expected_output": "racecar\n"},
+    {"input": "a\n", "expected_output": "a\n"},
+    {"input": "abc123\n", "expected_output": "321cba\n"}
+  ]
+}

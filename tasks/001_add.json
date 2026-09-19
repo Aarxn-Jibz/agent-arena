@@ -1,0 +1,12 @@
+{
+  "id": "001",
+  "title": "Add two integers",
+  "prompt": "Read two integers a and b from stdin and print their sum.",
+  "timeout_seconds": 2,
+  "tests": [
+    {"input": "2 3\n", "expected_output": "5\n"},
+    {"input": "-5 12\n", "expected_output": "7\n"},
+    {"input": "0 0\n", "expected_output": "0\n"},
+    {"input": "1000000 -1000000\n", "expected_output": "0\n"}
+  ]
+}
