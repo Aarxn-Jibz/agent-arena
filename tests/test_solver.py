@@ -9,7 +9,15 @@ import shutil
 import tempfile
 import unittest
 
-from arena.solver import build_feedback, build_prompt, extract_c_code, solve
+from arena.solver import (
+    PROMPT_STRATEGIES,
+    build_feedback,
+    build_prompt,
+    build_prompt_plain,
+    build_prompt_strict,
+    extract_c_code,
+    solve,
+)
 
 HAS_TCC = shutil.which("tcc") is not None
 
@@ -47,6 +55,50 @@ class BuildMessagesTest(unittest.TestCase):
         self.assertNotIn("expected_output", prompt)
         self.assertNotIn("5", prompt)
         self.assertIn("```c", prompt)
+
+    def test_default_prompt_is_few_shot(self):
+        # the standalone Solver keeps using the verified exemplar prompt
+        self.assertEqual(build_prompt(ADD_TASK), PROMPT_STRATEGIES["few_shot"](ADD_TASK))
+        self.assertIn("multiply two integers", build_prompt(ADD_TASK))
+
+    def test_strategies_are_generic_and_distinct(self):
+        prompts = {name: fn(ADD_TASK) for name, fn in PROMPT_STRATEGIES.items()}
+        self.assertEqual(set(prompts), {"plain", "strict", "few_shot"})
+        for name, prompt in prompts.items():
+            self.assertIn("id=001", prompt)
+            self.assertIn("Read two integers a and b", prompt)
+            self.assertNotIn("expected_output", prompt)
+            self.assertNotIn("5", prompt)  # hidden expected outputs never leak
+            self.assertIn("```c", prompt)
+        # few_shot has the exemplar, plain/strict do not
+        self.assertIn("multiply two integers", prompts["few_shot"])
+        self.assertNotIn("multiply two integers", prompts["plain"])
+        self.assertNotIn("multiply two integers", prompts["strict"])
+        # the strategies are visibly different from each other
+        self.assertNotEqual(prompts["plain"], prompts["strict"])
+        self.assertNotEqual(prompts["strict"], prompts["few_shot"])
+        self.assertNotEqual(prompts["plain"], prompts["few_shot"])
+
+    def test_default_solver_uses_default_prompt(self):
+        seen = {}
+
+        def generate(messages):
+            seen["first"] = messages[0]["content"]
+            return "```c\n" + BAD_C + "\n```"
+
+        solve(ADD_TASK, generate, max_attempts=1)
+        self.assertEqual(seen["first"], build_prompt(ADD_TASK))
+
+    def test_custom_prompt_builder_is_used(self):
+        seen = {}
+
+        def generate(messages):
+            seen["first"] = messages[0]["content"]
+            return "```c\n" + BAD_C + "\n```"
+
+        solve(ADD_TASK, generate, max_attempts=1,
+              prompt_builder=PROMPT_STRATEGIES["strict"])
+        self.assertEqual(seen["first"], build_prompt_strict(ADD_TASK))
 
 
 @unittest.skipUnless(HAS_TCC, "tcc not on PATH")

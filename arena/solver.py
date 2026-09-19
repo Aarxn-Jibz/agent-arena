@@ -58,6 +58,39 @@ def build_prompt(task: dict) -> str:
     )
 
 
+def build_prompt_plain(task: dict) -> str:
+    """Minimal prompt strategy: just the task and a request for C. No exemplar."""
+    return (
+        "You are solving C programming problems. Write a complete compilable C\n"
+        "program that reads from stdin and writes to stdout.\n\n"
+        f"Problem (id={task['id']}): {task['prompt']}\n\n"
+        "Return your answer as exactly one C code block: ```c ... ```"
+    )
+
+
+def build_prompt_strict(task: dict) -> str:
+    """Strict prompt strategy: exact-output constraints, no exemplar."""
+    return (
+        "You are solving C programming problems. Write ONLY a complete compilable C\n"
+        "program that reads from stdin and writes to stdout. The program must print\n"
+        "EXACTLY the required output and nothing else: no prompts, no labels, no\n"
+        "explanations, no extra text. Do not explain.\n\n"
+        f"Problem (id={task['id']}): {task['prompt']}\n\n"
+        "Return your answer as exactly one C code block: ```c ... ```"
+    )
+
+
+# Generic prompt strategies the Solver agent can choose between. `few_shot`
+# is the verified default used by `build_prompt` (exemplar + task). All are
+# task-generic: none special-case a specific exercise and none leak hidden
+# expected outputs.
+PROMPT_STRATEGIES = {
+    "plain": build_prompt_plain,
+    "strict": build_prompt_strict,
+    "few_shot": build_prompt,
+}
+
+
 def build_feedback(result: EvalResult) -> str:
     """Compiler/test feedback for one attempt, shaped for the model."""
     if not result.compiled:
@@ -98,14 +131,20 @@ def extract_c_code(reply: str) -> str | None:
 
 
 def solve(task: dict, generate, max_attempts: int = 3,
-          log_path: str | None = None) -> SolverResult:
+          log_path: str | None = None,
+          prompt_builder=build_prompt,
+          feedback_builder=build_feedback) -> SolverResult:
     """Retry loop: generate -> arena evaluate -> feedback -> retry.
 
     `generate(messages)` receives the transcript so far (list of
     {"role", "content"} dicts) and returns the model's reply text.
     Stops on success or when `max_attempts` are exhausted.
+
+    `prompt_builder(task)` builds the first user message (default: the
+    verified few-shot prompt) and `feedback_builder(result)` shapes the
+    retry feedback; callers may override either without changing the loop.
     """
-    messages = [{"role": "user", "content": build_prompt(task)}]
+    messages = [{"role": "user", "content": prompt_builder(task)}]
     rewards: list[float] = []
     eval_results: list[dict] = []
     sources: list[str] = []
@@ -122,7 +161,7 @@ def solve(task: dict, generate, max_attempts: int = 3,
             append_trajectory(log_path, trajectory_entry(task, attempt, source, asdict(result)))
         if result.success:
             return SolverResult(True, attempt, last_source, rewards, eval_results, sources, log_path)
-        feedback = f"Attempt {attempt} failed.\n{build_feedback(result)}\n"
+        feedback = f"Attempt {attempt} failed.\n{feedback_builder(result)}\n"
         messages.append({"role": "assistant", "content": reply})
         messages.append({"role": "user", "content": feedback +
                          "\nFix the program and write the complete corrected C "
