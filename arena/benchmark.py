@@ -13,7 +13,7 @@ class Case:
     """One deterministic generated input; keep its generator config in evidence."""
 
     name: str
-    stdin: str
+    stdin: str | bytes
 
 
 class Benchmark(Protocol):

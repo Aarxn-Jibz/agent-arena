@@ -110,7 +110,10 @@ def write_episode(root: str | Path, record: dict) -> tuple[Path, Path]:
         f"## Challenger\n\n{record['challenger']['request']}\n\n"
         f"Rationale: {record['challenger'].get('rationale') or 'not supplied'}\n\n"
         f"## Solver\n\n{record['solver']['response']}\n\n"
-        f"## Judge\n\n{record['judge']['feedback']}\n",
+        f"## Judge\n\n{record['judge']['feedback']}\n\n"
+        f"### Build\n\n```json\n{json.dumps(record['build'], indent=2)}\n```\n\n"
+        f"### Correctness\n\n```json\n{json.dumps(record['correctness'], indent=2)}\n```\n\n"
+        f"### Performance\n\n```json\n{json.dumps(record['performance'], indent=2)}\n```\n",
         encoding="utf-8",
     )
     with (directory / "events.jsonl").open("a", encoding="utf-8") as stream:

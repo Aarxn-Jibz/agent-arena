@@ -38,13 +38,14 @@ class SandboxResult:
     stdout: str
     stderr: str
     elapsed_ms: int
+    stdout_bytes: bytes = b""
+    stderr_bytes: bytes = b""
 
 
-def _input_archive(source: str, stdin: str) -> bytes:
+def _input_archive(source: str, stdin: bytes) -> bytes:
     payload = io.BytesIO()
     with tarfile.open(fileobj=payload, mode="w") as archive:
-        for name, value in (("solution.c", source), ("stdin.txt", stdin)):
-            data = value.encode("utf-8")
+        for name, data in (("solution.c", source.encode("utf-8")), ("stdin.txt", stdin)):
             info = tarfile.TarInfo(name)
             info.size = len(data)
             info.mode = 0o644
@@ -52,12 +53,14 @@ def _input_archive(source: str, stdin: str) -> bytes:
     return payload.getvalue()
 
 
-def run_c(source: str, stdin: str = "", config: SandboxConfig = SandboxConfig()) -> SandboxResult:
+def run_c(source: str, stdin: str | bytes = "", config: SandboxConfig = SandboxConfig(),
+          args: tuple[str, ...] = ()) -> SandboxResult:
     """Build and run once in a disposable offline container.
 
     Requires a previously built local image. Never mounts experiment files.
     """
-    if len(source.encode("utf-8")) + len(stdin.encode("utf-8")) > (config.tmpfs_mb // 2) * 524288:
+    stdin_bytes = stdin.encode("utf-8") if isinstance(stdin, str) else stdin
+    if len(source.encode("utf-8")) + len(stdin_bytes) > (config.tmpfs_mb // 2) * 524288:
         raise ValueError("source and input exceed sandbox workspace budget")
     name = f"arena-{uuid.uuid4().hex}"
     half = config.tmpfs_mb // 2
@@ -75,10 +78,10 @@ def run_c(source: str, stdin: str = "", config: SandboxConfig = SandboxConfig())
         f"--env=COMPILE_SECONDS={config.compile_seconds}",
         f"--env=OUTPUT_BYTES={config.output_bytes}",
         f"--env=OUTPUT_KB={(config.output_bytes + 1023) // 1024}",
-        config.image,
+        config.image, *args,
     ]
     try:
-        process = subprocess.run(command, input=_input_archive(source, stdin),
+        process = subprocess.run(command, input=_input_archive(source, stdin_bytes),
                                  capture_output=True,
                                  timeout=config.compile_seconds + config.timeout_seconds + 15)
     except subprocess.TimeoutExpired as exc:
@@ -94,20 +97,23 @@ def run_c(source: str, stdin: str = "", config: SandboxConfig = SandboxConfig())
             member = archive.extractfile(info)
             if member is None or info.size > config.output_bytes + 32:
                 raise ValueError("invalid sandbox result")
-            return member.read().decode("utf-8", errors="replace")
+            return member.read()
 
         compile_status = int(read("compile.status"))
         program_status = int(read("program.status"))
         compiled = compile_status == 0
+        stdout = read("program.stdout.bounded")
+        stderr = read("program.stderr.bounded")
         return SandboxResult(
             compiled=compiled, compile_exit_code=compile_status,
-            compile_stdout=read("compile.stdout.bounded"),
-            compile_stderr=read("compile.stderr.bounded"),
+            compile_stdout=read("compile.stdout.bounded").decode("utf-8", errors="replace"),
+            compile_stderr=read("compile.stderr.bounded").decode("utf-8", errors="replace"),
             exit_code=program_status if compiled else None,
             timed_out=compiled and (program_status == 124 or
                                     (program_status == 137 and
                                      int(read("elapsed_ms")) >= config.timeout_seconds * 1000)),
-            stdout=read("program.stdout.bounded"),
-            stderr=read("program.stderr.bounded"),
+            stdout=stdout.decode("utf-8", errors="replace"),
+            stderr=stderr.decode("utf-8", errors="replace"),
             elapsed_ms=int(read("elapsed_ms")),
+            stdout_bytes=stdout, stderr_bytes=stderr,
         )
