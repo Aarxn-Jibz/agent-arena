@@ -14,6 +14,8 @@ class Case:
 
     name: str
     stdin: str | bytes
+    expected: bytes | None = None
+    malformed: bool = False
 
 
 class Benchmark(Protocol):

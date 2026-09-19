@@ -23,7 +23,7 @@ class SandboxConfig:
     def __post_init__(self):
         if (self.cpus <= 0 or self.memory_mb < 32 or self.pids < 2 or
                 self.tmpfs_mb < 2 or self.timeout_seconds <= 0 or
-                self.compile_seconds <= 0 or not 1024 <= self.output_bytes <= 1048576):
+                self.compile_seconds <= 0 or not 1024 <= self.output_bytes <= 8 * 1048576):
             raise ValueError("invalid sandbox resource limits")
 
 

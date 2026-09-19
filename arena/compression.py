@@ -8,7 +8,7 @@ import statistics
 from datetime import datetime, timezone
 
 from .benchmark import Case
-from .evidence import write_episode
+from .bench_result import record_judgement
 from .sandbox import SandboxConfig, run_c
 
 KINDS = ("repetitive", "text", "source", "records", "mixed", "entropy", "binary", "edge")
@@ -143,23 +143,7 @@ class CompressionBenchmark:
                        patch: str | None = None, config: SandboxConfig = SandboxConfig(),
                        evaluated: dict | None = None):
         result = evaluated if evaluated is not None else self.evaluate(source, challenge, config)
-        if result["accepted"] != bool(git_after):
-            raise ValueError("git_after must be supplied exactly when Judge accepts")
-        record = {"run_id": run_id, "episode_id": episode_id, "benchmark": self.name,
-                  "seeds": {"corpus": challenge["seed"]}, "git_before": git_before,
-                  "challenger": {"request": challenge, "rationale": rationale},
-                  "solver": {"response": solver_response, "candidate": source, "patch": patch},
-                  "input_generation": {"generator": "compression-v1", "seed": challenge["seed"],
-                                       "config": challenge},
-                  "build": result["build"], "correctness": result["correctness"],
-                  "performance": result["performance"],
-                  "judge": {"feedback": result["feedback"], "reward_inputs": result["reward_inputs"],
-                            "resource_usage": {"memory_bytes": None}},
-                  "rewards": {"solver": result["reward_inputs"]["solver_reward"],
-                              "challenger": result["reward_inputs"]["challenger_reward"]},
-                  "outcome": "accepted" if result["accepted"] else "rejected",
-                  "git_after": git_after,
-                  "timestamps": {"started_at": result["started_at"],
-                                 "candidate_at": result["started_at"],
-                                 "finished_at": result["finished_at"]}}
-        return write_episode(root, record)
+        return record_judgement(root, benchmark=self.name, run_id=run_id,
+                                episode_id=episode_id, challenge=challenge, source=source,
+                                evaluation=result, git_before=git_before, git_after=git_after,
+                                solver_response=solver_response, rationale=rationale, patch=patch)
