@@ -1,93 +1,103 @@
 # Agent Arena
 
-A minimal adversarial C-programming learning environment: submitted C source is
-compiled with **TCC**, executed against deterministic tests, scored with a
-simple reward, and logged as trajectories for future policy optimization.
+A minimal autonomous C-programming environment where a small language model
+generates C programs, receives deterministic compiler/test feedback and
+rewards, retries solutions, and records trajectories for future
+reinforcement-learning experiments. Submitted C is compiled with **TCC** only,
+run against deterministic hidden tests, scored with a simple reward, and logged
+as JSONL trajectories.
 
-This is a prototype for the honours project. The long-term goal is to collect
-interaction trajectories for adversarial MARL / policy optimization between a
-*Challenger* (writes problems) and a *Solver* (writes C code). **No training of
-any kind has happened yet** — this repository is the deterministic environment
-that will produce the data.
+This is a submission-ready prototype for the honours project. It is a
+**trajectory-collection environment**: the model runs in inference mode and no
+weight updates or reinforcement-learning training have been performed yet.
 
-## What is implemented
+## Research motivation
 
-- Compile C source with TCC (`tcc solution.c -o solution`), capturing
-  exit code, stdout and stderr of the compiler.
-- Run the binary per test case with a configurable timeout
-  (`time.perf_counter()` timing, infinite loops are killed).
-- Deterministic test evaluation: stdin -> program -> stdout, compared via a
-  simple normalization (CRLF -> LF, trailing whitespace stripped per line,
-  trailing blank lines dropped). A test passes only if the program exits 0,
-  does not time out, and its normalized stdout matches exactly.
-- Deterministic reward:
-  ```
-  reward = 1 (compiled) + 10 * passed/total
-           + 5 (all tests pass, no timeout)
-           - 5 (any timeout)
-           - 1 per test that exits non-zero
-           - 0.5 per attempt beyond the first
-  ```
-  Compile failures score 0.
-- JSONL trajectory logging (one JSON object per attempt).
-- Small CLI, 3 sample tasks, and demo solutions.
-- **Solver agent** (experimental): `HuggingFaceTB/SmolLM2-360M-Instruct` generates
-  C from the task prompt, the arena judges it with TCC, compiler/test feedback
-  is returned to the model, and the loop retries up to a configurable cap.
-  Generation uses light sampling (temperature 0.9, top_p 0.9, bounded at 512
-  tokens) so retries can actually vary; greedy decoding repeatedly produced
-  byte-identical, feedback-unaware answers on the small model.
-- **Verified real runs** (see below): task 001 solved on attempt 1; task 002
-  and 003 failed within 3 attempts — SmolLM2-360M does not yet reliably follow
-  strict exact-output constraints, which is precisely the data this
-  environment is meant to collect.
+- Small language models (such as the 360M-parameter SmolLM2) are often weak and
+  inconsistent programmers, and they struggle to follow strict exact-output
+  constraints.
+- C is a useful test bed because correctness can be evaluated **objectively**:
+  a program either compiles (or not) and either passes deterministic tests (or
+  not).
+- The environment provides machine-verifiable feedback and reward signals at
+  every step (compiler diagnostics, test results, rewards), which an agent can
+  use to improve its next attempt.
+- The collected trajectories are intended to support **future** policy
+  optimization and adversarial MARL between a Challenger (problem writer) and a
+  Solver (programmer).
 
-## Architecture
+## Current architecture
 
 ```
-problem (task JSON)
-   -> C source
-   -> TCC compile (arena/runner.py)
-   -> run against tests (arena/evaluate.py)
-   -> reward (arena/evaluate.py compute_reward)
-   -> retry / stop
-   -> trajectory log (arena/log.py)
+Problem
+   |
+   v
+SmolLM2 Solver
+   |
+   v
+Generated C
+   |
+   v
+TCC compiler
+   |
+   +--> compiler feedback
+   |
+   v
+Deterministic tests
+   |
+   +--> stdout/stderr/runtime
+   |
+   v
+Reward
+   |
+   +--> trajectory JSONL
+   |
+   +--> feedback to Solver for retry
 ```
 
-| File | Purpose |
-| --- | --- |
-| `arena/runner.py` | TCC compile + process execution with timeout |
-| `arena/evaluate.py` | task loading, output normalization, test evaluation, reward |
-| `arena/log.py` | JSONL trajectory logging |
-| `arena/solver.py` | Solver retry loop (model-agnostic: feedback + retries) |
-| `arena/solver_llm.py` | optional transformers adapter (SmolLM2-360M-Instruct) |
-| `arena/cli.py`, `arena/__main__.py` | `python -m arena` command line |
-| `tasks/*.json` | sample tasks (add, max of array, reverse string) |
-| `solutions/*.c` | demo solutions incl. compile-error / wrong / infinite cases |
-| `tests/` | `unittest` suite (61 tests) |
+## Implemented features
 
-## Setup
+- **TCC-only compilation** (`arena/runner.py`): the single C compiler; captures
+  compiler exit code, stdout, and stderr.
+- **Execution timeout**: per-task `timeout_seconds`; infinite loops are killed
+  and reported.
+- **stdin/stdout test cases**: each task carries test cases with input and
+  expected output; output is compared after a simple normalization (CRLF -> LF,
+  trailing whitespace stripped per line, trailing blank lines dropped).
+- **Runtime measurement**: wall-clock timing via `time.perf_counter()`.
+- **Deterministic reward** (`arena/evaluate.py`): one reward value per attempt
+  (see [Reward](#reward)).
+- **JSONL trajectory logging** (`arena/log.py`): one JSON object per attempt,
+  including generated source, full evaluation result, reward, and metadata.
+- **CLI** (`arena/cli.py`): `python -m arena run` (deterministic judge) and
+  `python -m arena solve` (LLM retry loop).
+- **Solver retry loop** (`arena/solver.py`): model-agnostic; returns
+  compiler/test feedback to the model and retries up to a configurable cap.
+- **Hugging Face SmolLM2-360M-Instruct integration** (`arena/solver_llm.py`,
+  optional dependency): CPU-inference adapter, chat-template based, hidden
+  tests never shown to the model.
+- **Automated tests**: `unittest` suite (61 tests) exercising the arena with
+  the real TCC binary.
 
-Requirements: Linux/WSL, Python 3.10+, the `tcc` binary.
+## Not implemented / future work
 
-Install TCC (Ubuntu/Debian WSL):
+Explicitly **not** implemented — these are future work, not current behaviour:
 
-```bash
-sudo apt-get install tcc
-```
+- Challenger agent / adversarial task generation;
+- LoRA, PPO, GRPO, or any reinforcement-learning weight updates;
+- MARL policy optimization (Solver/Challenger co-training);
+- learned curriculum.
 
-> This repository was developed on a machine without passwordless sudo, so
-> TCC 0.9.27 was bootstrapped into `~/.local/bin` from the official source
-> (`https://download.savannah.gnu.org/releases/tinycc/tcc-0.9.27.tar.bz2`)
-> with a one-line patch to `lib/bcheck.c` disabling the malloc hooks on
-> glibc >= 2.34. If `tcc` is not on PATH, export
-> `PATH="$HOME/.local/bin:$PATH"` or set
-> `TCC_BIN=/path/to/tcc`. **TCC is the only C compiler used by the arena.**
+No model weights have been updated; the model runs in inference mode only.
 
-No Python dependencies outside the standard library are required for the
-deterministic arena. The optional LLM Solver additionally needs
-`torch` + `transformers` (CPU build is enough); they are installed in the
-project `.venv`:
+## Setup (WSL/Linux)
+
+Requirements: Linux/WSL, Python 3.10+, and the `tcc` binary.
+
+### 1. Python virtual environment
+
+The deterministic arena needs only the standard library. The optional LLM
+Solver additionally needs `torch` + `transformers` (a CPU build is enough):
 
 ```bash
 python3 -m venv .venv
@@ -95,40 +105,59 @@ python3 -m venv .venv
 .venv/bin/pip install transformers
 ```
 
-## Usage
+### 2. TCC
 
 ```bash
-# Run all tests
-python3 -m unittest discover -s tests -v
-
-# Evaluate a solution and print a summary
-python3 -m arena run tasks/001_add.json solutions/add.c
-
-# Full result as structured JSON
-python3 -m arena run --json tasks/002_max_array.json solutions/max_array.c
-
-# Append the attempt to a trajectory JSONL (retry loop friendly)
-python3 -m arena run tasks/001_add.json solutions/add.c --log trajectories/train.jsonl --attempt 1
-
-# Run the LLM Solver retry loop (hidden tests stay hidden from the model)
-.venv/bin/python -m arena solve tasks/001_add.json --attempts 3 --log trajectories/solver_001.jsonl
-
-# Exit code is 0 on pass, 1 on fail, 2 on usage/io error
+sudo apt-get install tcc
 ```
 
-## Demo
+Verify TCC:
 
 ```bash
+tcc -v          # e.g. "tcc version 0.9.27 (x86_64 Linux)"
+```
+
+> The arena resolves `tcc` on `PATH` (override with `TCC_BIN=/path/to/tcc`).
+> This repository was developed on a machine without passwordless sudo, so TCC
+> 0.9.27 was bootstrapped into `~/.local/bin` from the official source
+> (`https://download.savannah.gnu.org/releases/tinycc/tcc-0.9.27.tar.bz2`),
+> patching `lib/bcheck.c` to disable the malloc hooks on glibc >= 2.34. If your
+> `tcc` is not on `PATH`, export `PATH="$HOME/.local/bin:$PATH"` or set
+> `TCC_BIN`. **TCC is the only C compiler used by the arena.**
+
+### 3. Run the tests
+
+```bash
+python3 -m unittest discover -s tests     # 61 tests, uses the real tcc binary
+```
+
+## Demo commands
+
+### Deterministic arena demo (no LLM, works offline)
+
+```bash
+python3 -m arena run tasks/001_add.json solutions/add.c       # 4/4 pass, reward 16.0
 python3 -m arena run tasks/001_add.json solutions/bad.c       # compile error + diagnostics
 python3 -m arena run tasks/001_add.json solutions/wrong.c     # compiles, 1/4 pass
 python3 -m arena run tasks/001_add.json solutions/infinite.c  # timed out, penalty applied
-python3 -m arena run tasks/001_add.json solutions/add.c       # 4/4 pass, reward 16.0
+python3 -m arena run --json tasks/001_add.json solutions/add.c   # full result as JSON
+python3 -m arena run tasks/001_add.json solutions/add.c \
+  --log trajectories/demo.jsonl --attempt 1                     # append trajectory record
 ```
 
-Attempt 1 (wrong solution) and attempt 2 (correct solution) against
-`tasks/002_max_array.json` produce `reward: 1.0, success: false` then
-`reward: 15.5, success: true`, exactly mirroring the intended Solver retry
-loop — but driven by a submitted C file instead of a model.
+Exit code is `0` on pass, `1` on fail, `2` on usage/io error.
+
+### Real-model Solver demo (optional, needs `.venv` + Hugging Face access)
+
+```bash
+.venv/bin/python -m arena solve tasks/001_add.json --attempts 3 --log trajectories/demo.jsonl
+```
+
+This runs the full verified path: task -> SmolLM2 -> generated C -> TCC ->
+tests -> feedback -> retry -> reward -> trajectory JSONL. On first run the
+model downloads roughly 700 MB (about 7 minutes); later loads are cached
+(about 30-60 s). If model loading fails tomorrow, the deterministic demo above
+still demonstrates everything except the LLM step.
 
 ## Task format
 
@@ -139,53 +168,96 @@ loop — but driven by a submitted C file instead of a model.
   "prompt": "Read two integers a and b from stdin and print their sum.",
   "timeout_seconds": 2,
   "tests": [
-    {"input": "2 3\n", "expected_output": "5\n"}
+    {"input": "2 3\n", "expected_output": "5\n"},
+    {"input": "-5 12\n", "expected_output": "7\n"}
   ]
 }
 ```
 
-`python -m arena run` reports per-test stdout, stderr, exit code, timeout flag
-and elapsed time in the JSON result (`tests[].*`) plus the last test's
-`program_stdout` / `program_stderr` / `program_exit_code` at the top level.
+Required fields: `id`, `title`, `prompt`, `timeout_seconds` (positive number),
+and a non-empty `tests` list where every test has `input` and
+`expected_output`. Three sample tasks ship in `tasks/` (add, max of array,
+reverse string).
 
-## Experimental observations (SmolLM2-360M-Instruct, CPU)
+## Reward
 
-All runs used greedy-bounded light sampling (temperature 0.9, top_p 0.9, at
-most 512 generated tokens; sampling – not greedy – because greedy decoding
-repeatedly returned byte-identical, feedback-unaware programs). The prompt is:
-solver instructions, a clearly labeled **different**-task exemplar, the real
-task exactly once, then a request for one C code block. Expected outputs of the
-real task are never shown to the model; the TCC/test environment is the only
-judge.
+For one evaluated attempt:
 
-Verified real path: model → generated C → TCC compile → tests → compiler/test
-feedback → retry up to 3 attempts → deterministic reward → JSONL trajectory.
+```
+reward = 1 (compiled)
+         + 10 * passed/total
+         + 5  (all tests pass, no timeout)
+         - 5  (any timeout)
+         - 1  per test that exits with a non-zero code (and did not time out)
+         - 0.5 * (attempt - 1)      <-- retry penalty beyond the first attempt
+```
 
-- **task 001 (add two integers): a real successful rollout.** The model
-  generated the minimal correct program on attempt 1; 4/4 tests passed, reward
-  16.0, trajectory `trajectories/solver_001.jsonl`.
-- **task 002 (max of array): failed within 3 attempts** — 1/5, then 4/5
-  (subtle input-scanner bug), then a compile error (missing `<limits.h>`),
-  rewards [3.0, 8.5, 0.0].
-- **task 003 (reverse string): failed within 3 attempts** — the same
-  non-reversing, labeled program repeated 3 times, rewards [1.0, 0.5, 0.0].
-- Earlier repeated trials showed substantial stochasticity and inconsistent
-  success for task 001 (success in some trials after 1-2 attempts, failure in
-  others). The small model does not yet reliably follow exact-output
-  constraints, which is precisely the kind of signal this environment is meant
-  to collect.
-- **No model weight training, fine-tuning, LoRA, or MARL/policy optimization
-  has been performed.** The model runs in inference mode only; trajectories are
-  collected for future work.
+Compile failures score `0.0`. A test passes only if the program exits 0, does
+not time out, and its normalized stdout equals the normalized expected output.
+The mapping from (source, task, attempt) to reward is deterministic — the same
+input always yields the same reward.
 
-## Deliberate future work (not implemented)
+## Real results (SmolLM2-360M-Instruct, CPU)
 
-- **Challenger agent**: LLM-generated problems with deterministically validated
-  test cases.
-- **Adversarial MARL / PPO / GRPO / fine-tuning / policy optimization**: none of
-  this exists yet. The arena and Solver only produce data.
+Configuration: temperature 0.9, top_p 0.9, at most 512 generated tokens,
+maximum 3 attempts. The prompt hides expected test outputs and shows one
+clearly labeled *different*-task exemplar before the real task.
 
-Everything in the deterministic arena is deterministic: an evaluation of the
-same (source, task) yields the same reward, the same pass/fail results, and the
-same trajectories except for wall-clock timing fields. LLM generation is
-stochastic by design and is recorded verbatim in each attempt's trajectory.
+| Task | Result | Attempt progression | Rewards |
+| --- | --- | --- | --- |
+| 001 Add two integers | SUCCESS | pass on attempt 1 (4/4 tests) | [16.0] |
+| 002 Max element of array | FAILURE | 1/5 -> 4/5 -> compile error (missing `<limits.h>`) | [3.0, 8.5, 0.0] |
+| 003 Reverse a string | FAILURE | 0/4, 0/4, 0/4 (repeated non-reversing solution) | [1.0, 0.5, 0.0] |
+
+Trajectories: `trajectories/solver_001.jsonl`, `solver_002.jsonl`,
+`solver_003.jsonl`.
+
+Interpretation (no causal claims beyond the data):
+
+- Task 001 proves full successful end-to-end execution: model -> generated C ->
+  TCC -> tests -> reward -> trajectory, with reward 16.0.
+- Task 002 demonstrates feedback-associated improvement from 1/5 to 4/5 tests
+  before a regression (a compile error) on the final attempt.
+- Task 003 demonstrates a limitation: the model fails to effectively use
+  feedback, repeating the same non-reversing solution.
+- Together these outcomes motivate future policy optimization on the collected
+  trajectories.
+
+## Performance observation
+
+- Model generation: about 10 seconds per reply (~90-130 tokens) on CPU.
+- TCC compile + 4-test evaluation: well under ~10 ms for the measured cases.
+- First model load/download: ~7 minutes including roughly 700 MB download;
+  cached subsequent load: ~30-60 s.
+
+LLM inference therefore dominates the runtime of the current prototype; the
+deterministic judging step is negligible in comparison.
+
+## Limitations
+
+- Tiny 360M-parameter model.
+- CPU-only, fp32 inference (no quantization).
+- Stochastic generation (light sampling), so results vary between runs.
+- Small, fixed sample-task set (3 tasks).
+- No weight updates, fine-tuning, or RL/MARL training of any kind.
+- TCC is the only supported C compiler.
+- Current tests/rewards are task-specific deterministic evaluation, not a
+  general-purpose verifier.
+- No adversarial Challenger agent yet.
+
+## Future MARL design (conceptual, not implemented)
+
+```
+  Challenger --> task --> Solver
+      ^                    |
+      |                    v
+      +-- reward <--- Judge ---> Solver reward
+```
+
+- The Solver would optimize task-solving performance against the deterministic
+  judge.
+- The Challenger would seek valid tasks near the Solver's capability frontier
+  (hard but solvable).
+- The deterministic judge remains the authoritative correctness signal in any
+  such design.
+- Policy updates are future work; this repository currently only collects data.
