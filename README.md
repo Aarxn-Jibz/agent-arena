@@ -1,5 +1,10 @@
 # Agent Arena
 
+The future generic benchmark and sandbox contracts are in
+[docs/arena.md](docs/arena.md) and [docs/evidence.md](docs/evidence.md).
+The existing CLI paths below remain the original small C-task prototype;
+they are not yet connected to the new Docker runner.
+
 A minimal autonomous C-programming environment where a small language model
 generates C programs, receives deterministic compiler/test feedback and
 rewards, retries solutions, and records trajectories for future

@@ -1,0 +1,9 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tcc libc6-dev coreutils tar util-linux && rm -rf /var/lib/apt/lists/*
+COPY sandbox/judge.sh /usr/local/bin/arena-judge
+RUN chmod 0755 /usr/local/bin/arena-judge
+# Trusted root judge can use tools; uid 65534 running candidate code cannot.
+RUN chmod 0700 /usr/bin /usr/sbin /usr/local/bin
+ENTRYPOINT ["/usr/local/bin/arena-judge"]
