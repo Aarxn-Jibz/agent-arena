@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import statistics
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from .bench_result import record_judgement
@@ -229,7 +230,9 @@ class SearchBenchmark(ValidationBenchmark):
         docs, queries = self.generate(challenge)
         started = _now()
         document_input = (str(len(docs)) + "\n" + "\n".join(" ".join(words) for words in docs) + "\n").encode()
-        built = run_c(source, document_input, config, args=("build",))
+        index_config = replace(config, output_bytes=min(8 * 1048576,
+            max(config.output_bytes, 1024 + 2 * len(document_input))))
+        built = run_c(source, document_input, index_config, args=("build",))
         build = {"exit_code": built.compile_exit_code, "stdout": built.compile_stdout,
                  "stderr": built.compile_stderr}
         checks, query_times = [], []
@@ -237,7 +240,7 @@ class SearchBenchmark(ValidationBenchmark):
             for query in queries:
                 index = built.stdout_bytes
                 payload = len(index).to_bytes(4, "big") + index + query.encode() + b"\n"
-                result = run_c(source, payload, config, args=("query", challenge["matching"]))
+                result = run_c(source, payload, index_config, args=("query", challenge["matching"]))
                 checks.append(result.compiled and result.exit_code == 0 and not result.timed_out and
                               result.stdout_bytes == self.oracle(docs, query, challenge["matching"]))
                 query_times.append(result.elapsed_ms)

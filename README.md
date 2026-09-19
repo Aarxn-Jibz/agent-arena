@@ -4,6 +4,9 @@ The future generic benchmark and sandbox contracts are in
 [docs/arena.md](docs/arena.md) and [docs/evidence.md](docs/evidence.md).
 The existing CLI paths below remain the original small C-task prototype;
 they are not yet connected to the new Docker runner.
+The current benchmark suite, evaluator method, and remaining gaps are in
+[docs/research.md](docs/research.md). The read-only local viewer is documented
+in [docs/viewer.md](docs/viewer.md).
 
 A minimal autonomous C-programming environment where a small language model
 generates C programs, receives deterministic compiler/test feedback and
@@ -283,4 +286,5 @@ deterministic judging step is negligible in comparison.
   (hard but solvable).
 - The deterministic judge remains the authoritative correctness signal in any
   such design.
-- Policy updates are future work; this repository currently only collects data.
+- The current tabular policies update task and prompt choices; task-generating
+  agents and model-weight updates remain future work.

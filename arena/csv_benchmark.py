@@ -6,6 +6,7 @@ import csv
 import io
 import random
 import statistics
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from .bench_result import record_judgement
@@ -137,7 +138,9 @@ class CsvBenchmark:
         started_at = _now()
         checks, metrics, build = [], [], None
         for case in self.generate_cases(challenge, challenge["seed"]):
-            result = run_c(source, case.stdin, config,
+            case_config = replace(config, output_bytes=min(8 * 1048576,
+                max(config.output_bytes, 1024 + 2 * len(case.expected or b""))))
+            result = run_c(source, case.stdin, case_config,
                            args=(challenge["operation"], str(challenge["column"]), challenge["value"]))
             if build is None:
                 build = {"exit_code": result.compile_exit_code, "stdout": result.compile_stdout,

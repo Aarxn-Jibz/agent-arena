@@ -56,8 +56,10 @@ write directly to the accepted branch.
 | Secondary validation | cache engine; log analyzer; search/indexing engine | Measure transfer with a fixed protocol; do not update policies on these results. |
 | Held-out bosses | mini shell; tiny filesystem | Reserve for final evaluation, separate from training and tuning. |
 
-No full benchmark in this table is implemented yet. The interface in
-`arena/benchmark.py` is independent of task domain: initialize a benchmark,
+The listed benchmarks now have deterministic generators and Judges, with
+focused Docker integration tests. They are not yet connected to an autonomous
+agent coordinator. The interface in `arena/benchmark.py` is independent of
+task domain: initialize a benchmark,
 validate a challenge, generate cases, judge correctness and performance,
 provide reward inputs, and summarize. `arena.sandbox.run_c` owns the TCC build
 and returns compiler output, process output, status, and elapsed time. The
