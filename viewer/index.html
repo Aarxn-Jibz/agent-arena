@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Arena</title>
+<style>
+  :root { color-scheme: dark; font: 16px system-ui, sans-serif; background: #101721; color: #e9eef5; }
+  body { margin: 0; }
+  header { padding: 1rem 1.5rem; background: #1b2838; border-bottom: 1px solid #37506a; display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: center; }
+  h1 { font-size: 1.2rem; margin: 0; }
+  main { display: grid; grid-template-columns: minmax(13rem, 20rem) minmax(0, 1fr); gap: 1rem; padding: 1rem; }
+  nav, section { background: #1b2838; border: 1px solid #37506a; border-radius: .5rem; padding: 1rem; }
+  nav { max-height: calc(100vh - 7rem); overflow: auto; }
+  button, select { background: #263b52; color: inherit; border: 1px solid #6382a0; border-radius: .3rem; padding: .4rem; cursor: pointer; }
+  nav button { display: block; width: 100%; text-align: left; margin: .4rem 0; }
+  article { display: grid; gap: 1rem; }
+  h2 { margin: 0 0 .6rem; font-size: 1.1rem; letter-spacing: .07em; }
+  h3 { margin: 1rem 0 .3rem; font-size: .95rem; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #111d2a; padding: .7rem; border-radius: .3rem; max-height: 22rem; overflow: auto; }
+  .muted { color: #aebfce; } .accepted { color: #8de2b0; } .rejected { color: #ffae9e; }
+  @media (max-width: 700px) { main { grid-template-columns: 1fr; } nav { max-height: 15rem; } }
+</style>
+<header><h1>Agent Arena</h1><label>Run <select id="runs"></select></label><span id="context" class="muted">Waiting for evidence</span></header>
+<main><nav><h2>HISTORY</h2><div id="history"></div></nav><article>
+  <section><h2>CHALLENGER</h2><h3>Request and parameters</h3><pre id="request"></pre><h3>Rationale / targeted weakness</h3><pre id="rationale"></pre></section>
+  <section><h2>SOLVER</h2><h3>Response / approach</h3><pre id="response"></pre><h3>Candidate source</h3><pre id="candidate"></pre><h3>Diff from previous accepted version</h3><pre id="diff"></pre></section>
+  <section><h2>JUDGE</h2><h3>Build</h3><pre id="build"></pre><h3>Correctness</h3><pre id="correctness"></pre><h3>Performance</h3><pre id="performance"></pre><h3>Resource usage</h3><pre id="resources"></pre><h3>Rewards and verdict</h3><pre id="verdict"></pre></section>
+</article></main>
+<script>
+const $ = id => document.getElementById(id);
+const show = (id, value) => { $(id).textContent = typeof value === 'string' ? value : JSON.stringify(value ?? null, null, 2); };
+let currentRun = '', currentEpisode = 0;
+async function get(path) { const r = await fetch(path, {cache: 'no-store'}); if (!r.ok) throw Error(r.status); return r.json(); }
+async function selectEpisode(id) {
+  currentEpisode = id;
+  const e = await get(`/api/runs/${encodeURIComponent(currentRun)}/episodes/${id}`);
+  const elapsed = Date.parse(e.timestamps?.finished_at) - Date.parse(e.timestamps?.started_at);
+  $('context').textContent = `${currentRun} · ${e.benchmark} · episode ${id} · ${Number.isFinite(elapsed) ? (elapsed / 1000).toFixed(1) + 's' : 'elapsed unknown'}`;
+  show('request', e.challenger?.request); show('rationale', e.challenger?.rationale || 'Not supplied');
+  show('response', e.solver?.response); show('candidate', e.solver?.candidate); show('diff', e.source_diff);
+  show('build', e.build); show('correctness', e.correctness); show('performance', e.performance);
+  show('resources', e.judge?.resource_usage); show('verdict', {feedback: e.judge?.feedback, reward_inputs: e.judge?.reward_inputs, rewards: e.rewards, outcome: e.outcome});
+}
+async function refresh() {
+  try {
+    const runs = await get('/api/runs');
+    const desired = runs.includes(currentRun) ? currentRun : runs.at(-1) || '';
+    if (desired !== currentRun) { currentRun = desired; $('runs').replaceChildren(...runs.map(run => { const o = document.createElement('option'); o.value = run; o.textContent = run; return o; })); $('runs').value = currentRun; currentEpisode = 0; }
+    if (!currentRun) return;
+    const history = await get(`/api/runs/${encodeURIComponent(currentRun)}/episodes`);
+    $('history').replaceChildren(...history.map(item => {
+      const b = document.createElement('button');
+      b.textContent = `#${item.episode_id} ${item.benchmark} · ${item.outcome}\n${item.challenge}\n${item.headline}`;
+      b.onclick = () => selectEpisode(item.episode_id);
+      return b;
+    }));
+    if (history.length && !history.some(x => x.episode_id === currentEpisode)) await selectEpisode(history.at(-1).episode_id);
+  } catch (error) { $('context').textContent = `Evidence unavailable: ${error.message}`; }
+}
+$('runs').onchange = () => { currentRun = $('runs').value; currentEpisode = 0; refresh(); };
+refresh(); setInterval(refresh, 3000);
+</script>
+</html>
