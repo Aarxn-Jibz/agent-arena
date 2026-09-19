@@ -35,7 +35,10 @@ class ViewerTest(unittest.TestCase):
                 with urlopen(base + "/api/runs") as response:
                     self.assertEqual(json.load(response), ["demo"])
                 with urlopen(base + "/") as response:
-                    self.assertIn(b"CHALLENGER", response.read())
+                    page = response.read()
+                    self.assertIn(b"CHALLENGER", page)
+                    self.assertIn(b"challengerBefore", page)
+                    self.assertIn(b"solverAfter", page)
             finally:
                 server.shutdown()
                 server.server_close()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -28,12 +29,16 @@ def viewer_events(record: dict) -> list[dict]:
         {**base, "schema_version": SCHEMA_VERSION, "actor": "challenger", "kind": "challenge",
          "at": record["timestamps"]["started_at"],
          "request": record["challenger"]["request"],
-         "rationale": record["challenger"].get("rationale")},
+         "rationale": record["challenger"].get("rationale"),
+         "memory_before": record["challenger"].get("memory_before", []),
+         "memory_after": record["challenger"].get("memory_after", [])},
         {**base, "schema_version": SCHEMA_VERSION, "actor": "solver", "kind": "candidate",
          "at": record["timestamps"]["candidate_at"],
          "response": record["solver"]["response"],
          "candidate": record["solver"]["candidate"],
          "patch": record["solver"].get("patch"),
+         "memory_before": record["solver"].get("memory_before", []),
+         "memory_after": record["solver"].get("memory_after", []),
          "reference_reads": record.get("reference_reads", [])},
         {**base, "schema_version": SCHEMA_VERSION, "actor": "judge", "kind": "verdict",
          "at": record["timestamps"]["finished_at"],
@@ -106,10 +111,11 @@ def write_episode(root: str | Path, record: dict) -> tuple[Path, Path]:
     directory.mkdir(parents=True, exist_ok=True)
     stem = f"{episode_id:06d}"
     json_path, md_path = directory / f"{stem}.json", directory / f"{stem}.md"
-    if json_path.exists() or md_path.exists():
+    if json_path.exists():
         raise FileExistsError(f"episode {episode_id} already exists in run {run_id}")
-    json_path.write_text(json.dumps(saved, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    md_path.write_text(
+    json_tmp, md_tmp = json_path.with_suffix('.json.tmp'), md_path.with_suffix('.md.tmp')
+    json_tmp.write_text(json.dumps(saved, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    md_tmp.write_text(
         f"# Episode {episode_id}: {record['benchmark']}\n\n"
         f"- Outcome: {record['outcome']}\n"
         f"- Git: {record['git_before']} → {record['git_after'] or 'unchanged'}\n"
@@ -124,6 +130,8 @@ def write_episode(root: str | Path, record: dict) -> tuple[Path, Path]:
         f"### Performance\n\n```json\n{json.dumps(record['performance'], indent=2)}\n```\n",
         encoding="utf-8",
     )
+    os.replace(md_tmp, md_path)
+    os.replace(json_tmp, json_path)
     with (directory / "events.jsonl").open("a", encoding="utf-8") as stream:
         for event in events:
             stream.write(json.dumps(event, ensure_ascii=False) + "\n")
