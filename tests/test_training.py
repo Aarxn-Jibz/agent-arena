@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from arena.training import (Checkpoints, Curriculum, EpisodeOrchestrator, MockTrainer, ModelConfig,
+from arena.training import (Checkpoints, Curriculum, EpisodeOrchestrator, HFPEFTTrainer, MockTrainer, ModelConfig,
                             SolverResponse, WhitespaceTokenizer, challenger_reward, compose_context,
                             doctor_recommendations, failure_feedback, normalize_resource_status,
                             outcome_key, parse_solver_contract, reference_identity, validate_manifests,
@@ -10,6 +10,56 @@ from arena.training import (Checkpoints, Curriculum, EpisodeOrchestrator, MockTr
 
 
 class TrainingArchitectureTests(unittest.TestCase):
+    def test_hf_backend_adapter_isolation_checkpoint_and_offline_load(self):
+        class Param:
+            def __init__(self, n): self.n, self.requires_grad, self.device = n, True, "cpu"
+            def numel(self): return self.n
+        class Model:
+            def __init__(self):
+                self.params = {"base.weight": Param(100), "x.challenger.lora": Param(3), "x.solver.lora": Param(5)}; self.saved = []; self.loaded = []
+            def parameters(self): return self.params.values()
+            def named_parameters(self): return self.params.items()
+            def add_adapter(self, *x): pass
+            def set_adapter(self, name): self.active = name
+            def save_pretrained(self, path, selected_adapters): Path(path).mkdir(parents=True); self.saved.append(selected_adapters[0])
+            def load_adapter(self, path, adapter_name, is_trainable): self.loaded.append(adapter_name)
+        class Tokenizer:
+            @staticmethod
+            def from_pretrained(*args, **kwargs): return Tokenizer()
+        class Loader:
+            @staticmethod
+            def from_pretrained(*args, **kwargs): return Model()
+        class Opt:
+            def __init__(self, params, lr): self.params, self.lr = list(params), lr
+            def state_dict(self): return {"lr": self.lr}
+            def load_state_dict(self, value): self.restored = value
+        class Torch:
+            class optim: AdamW = Opt
+            @staticmethod
+            def save(value, path): Path(path).write_text(str(value))
+            @staticmethod
+            def load(path, **kwargs): return {"restored": True}
+            bfloat16 = float; float16 = float; float32 = float
+        class Config:
+            def __init__(self, **kwargs): self.kwargs = kwargs
+        deps = {"torch": Torch, "AutoTokenizer": Tokenizer, "AutoModelForCausalLM": Loader,
+                "BitsAndBytesConfig": Config, "LoraConfig": Config, "TaskType": type("T", (), {"CAUSAL_LM": "causal"}),
+                "get_peft_model": lambda model, config, adapter_name: model, "prepare_model_for_kbit_training": lambda model: model}
+        trainer = HFPEFTTrainer(ModelConfig(lora={"r": 2, "alpha": 4}), dependencies=deps).load()
+        self.assertEqual(trainer.active_adapter, "challenger")
+        self.assertNotEqual(trainer.optimizers["challenger"], trainer.optimizers["solver"])
+        self.assertEqual(trainer.adapter_state("solver")["trainable"], 5)
+        calls = []; trainer._solver_loss = lambda example: 1; trainer._step = lambda role, loss: calls.append(role) or 1.0
+        trainer.update_solver([{"input": {}, "target": {}}]); trainer.update_challenger({"valid": True, "log_probability": 1, "reward": 1})
+        self.assertEqual(calls, ["solver", "challenger"])
+        with tempfile.TemporaryDirectory() as d:
+            trainer.save_checkpoint(Path(d)); trainer.load_checkpoint(Path(d))
+            self.assertEqual(trainer.model.saved, ["challenger", "solver"]); self.assertEqual(trainer.model.loaded, ["challenger", "solver"])
+
+    def test_hf_backend_missing_libraries_fails_without_download(self):
+        with self.assertRaisesRegex(RuntimeError, "HF/PEFT runtime requires"):
+            HFPEFTTrainer(ModelConfig(), dependencies={}).load()
+
     def test_doctor_profiles(self):
         self.assertEqual(doctor_recommendations({"cuda": False})["solver_attempts"], 2)
         self.assertEqual(doctor_recommendations({"cuda": True, "vram_gb": 16})["adaptation"], "QLoRA")

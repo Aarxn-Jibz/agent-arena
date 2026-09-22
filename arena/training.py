@@ -97,7 +97,7 @@ def doctor_recommendations(profile: dict[str, Any]) -> dict[str, Any]:
 def doctor_report(profile: dict[str, Any] | None = None) -> dict[str, Any]:
     profile = hardware_profile() if profile is None else profile
     return {"hardware": profile, "recommendations": doctor_recommendations(profile),
-            "windows_judge": "UNVERIFIED" if platform.system() != "Windows" else "requires smoke test"}
+            "windows_judge": "WINDOWS JUDGE: UNVERIFIED — SMOKE TEST REQUIRED"}
 
 
 @dataclass
@@ -273,12 +273,202 @@ class MockTrainer:
 
 
 class HFPEFTTrainer:
-    """Lazy hook for tomorrow's HF/PEFT implementation; never downloads on construction."""
-    def __init__(self, model: ModelConfig): self.model = model
-    def _unavailable(self):
-        raise RuntimeError("HF/PEFT runtime is not loaded; install runtime dependencies and obtain the model on the GPU machine")
-    generate = update_challenger = update_solver = save_checkpoint = load_checkpoint = adapter_state = _unavailable
-    def health(self): return {"runtime": "hf-peft", "loaded": False, "model_id": self.model.model_id}
+    """HF/PEFT LoRA runtime.  Construction and tests never touch the network.
+
+    ``load()`` is intentionally explicit: tomorrow's run configuration decides
+    whether weights may be fetched.  Two named adapters share frozen base
+    weights while their optimizers and counters remain independent.
+    """
+    ROLES = ("challenger", "solver")
+
+    def __init__(self, model: ModelConfig, *, allow_download: bool = False, dependencies=None):
+        self.model_config, self.allow_download, self._injected = model, allow_download, dependencies
+        self.model = self.tokenizer = None
+        self.optimizers: dict[str, Any] = {}; self.steps = {role: 0 for role in self.ROLES}
+        self.baseline = 0.0; self.active_adapter = None
+
+    def _dependencies(self):
+        if self._injected: return self._injected
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+            from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+            return {"torch": torch, "AutoModelForCausalLM": AutoModelForCausalLM,
+                    "AutoTokenizer": AutoTokenizer, "BitsAndBytesConfig": BitsAndBytesConfig,
+                    "LoraConfig": LoraConfig, "TaskType": TaskType, "get_peft_model": get_peft_model,
+                    "prepare_model_for_kbit_training": prepare_model_for_kbit_training}
+        except ImportError as err:
+            raise RuntimeError("HF/PEFT runtime requires torch, transformers and peft (and bitsandbytes for 4-bit QLoRA)") from err
+
+    def _dtype(self, torch):
+        names = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}
+        try: return getattr(torch, names[self.model_config.precision])
+        except KeyError as err: raise ValueError("precision must be bf16, fp16, or fp32") from err
+
+    def load(self):
+        if self.model is not None: return self
+        d, torch = self._dependencies(), None
+        torch = d["torch"]; local = not self.allow_download
+        tokenizer_revision = self.model_config.tokenizer_revision or self.model_config.revision
+        self.tokenizer = d["AutoTokenizer"].from_pretrained(self.model_config.model_id, revision=tokenizer_revision,
+                                                               local_files_only=local)
+        kwargs = {"revision": self.model_config.revision, "local_files_only": local,
+                  "torch_dtype": self._dtype(torch)}
+        if self.model_config.quantization == "4bit":
+            kwargs["quantization_config"] = d["BitsAndBytesConfig"](load_in_4bit=True,
+                bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=self._dtype(torch), bnb_4bit_use_double_quant=True)
+            kwargs["device_map"] = "auto"
+        elif self.model_config.quantization != "none":
+            raise ValueError("quantization must be none or 4bit")
+        self.model = d["AutoModelForCausalLM"].from_pretrained(self.model_config.model_id, **kwargs)
+        if self.model_config.quantization == "4bit": self.model = d["prepare_model_for_kbit_training"](self.model)
+        lora = self.model_config.lora
+        targets = lora.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+        config = d["LoraConfig"](r=int(lora.get("r", 16)), lora_alpha=int(lora.get("alpha", 32)),
+            lora_dropout=float(lora.get("dropout", .05)), target_modules=targets, bias="none",
+            task_type=d["TaskType"].CAUSAL_LM)
+        self.model = d["get_peft_model"](self.model, config, adapter_name="challenger")
+        self.model.add_adapter("solver", config)
+        for parameter in self.model.parameters(): parameter.requires_grad = False
+        for role in self.ROLES:
+            self.set_adapter(role)
+            params = self._role_parameters(role)
+            if not params: raise RuntimeError(f"{role} adapter has zero trainable parameters")
+            lr = float(lora.get(f"{role}_lr", lora.get("learning_rate", 2e-4)))
+            self.optimizers[role] = torch.optim.AdamW(params, lr=lr)
+        self.set_adapter("challenger")
+        self.validate_trainable_parameters()
+        return self
+
+    def _role_parameters(self, role):
+        # PEFT parameter names contain their named adapter; this also keeps
+        # optimizer state independent even though adapters share a backbone.
+        return [p for name, p in self.model.named_parameters() if role in name and getattr(p, "requires_grad", False)]
+
+    def set_adapter(self, role: str):
+        if role not in self.ROLES: raise ValueError("role must be challenger or solver")
+        if self.model is None: self.load()
+        self.model.set_adapter(role)
+        for name, parameter in self.model.named_parameters(): parameter.requires_grad = role in name
+        self.active_adapter = role
+        return role
+
+    def validate_trainable_parameters(self):
+        if self.model is None: self.load()
+        total = sum(p.numel() for p in self.model.parameters())
+        report = {"total_parameters": total, "active_adapter": self.active_adapter}
+        for role in self.ROLES:
+            self.set_adapter(role); count = sum(p.numel() for p in self._role_parameters(role))
+            if not count: raise RuntimeError(f"{role} adapter has zero trainable parameters")
+            report[f"{role}_trainable_parameters"] = count
+            report[f"{role}_percent_trainable"] = 100 * count / max(1, total)
+        base_trainable = [name for name, p in self.model.named_parameters()
+                          if p.requires_grad and not any(role in name for role in self.ROLES)]
+        if base_trainable: raise RuntimeError("base model parameters are trainable: " + ", ".join(base_trainable[:3]))
+        self.set_adapter(report["active_adapter"])
+        return report
+
+    def _encode(self, text: str):
+        encoded = self.tokenizer(text, return_tensors="pt", add_special_tokens=False)
+        device = next(self.model.parameters()).device
+        return {key: value.to(device) for key, value in encoded.items()}
+
+    def count(self, text: str) -> int:
+        """Tokenizer-derived count for ``compose_context(..., trainer)``."""
+        self.load()
+        return len(self.tokenizer(text, add_special_tokens=False)["input_ids"])
+
+    def compose_prompt(self, parts: dict[str, str]):
+        """Apply the shared priority policy using this model's tokenizer."""
+        return compose_context(parts, self.model_config, self)
+
+    def generate(self, role: str, prompt: str, config: dict[str, Any]):
+        self.load(); self.set_adapter(role)
+        d = self._dependencies(); torch = d["torch"]; inputs = self._encode(prompt)
+        maximum = int(config.get("max_new_tokens", self.model_config.generation["max_new_tokens"]))
+        if inputs["input_ids"].shape[1] + maximum > self.model_config.context_length: raise ValueError("prompt exceeds configured context budget")
+        with torch.inference_mode():
+            output = self.model.generate(**inputs, max_new_tokens=maximum, do_sample=config.get("do_sample", True),
+                temperature=float(config.get("temperature", self.model_config.generation.get("temperature", .7))),
+                top_p=float(config.get("top_p", self.model_config.generation.get("top_p", .9))),
+                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
+        return self.tokenizer.decode(output[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+
+    def action_log_probability(self, prompt: str, action: dict[str, Any]):
+        """Differentiable log P(action JSON | prompt), retained for REINFORCE."""
+        self.load(); self.set_adapter("challenger"); torch = self._dependencies()["torch"]
+        action_text = json.dumps(action, sort_keys=True, separators=(",", ":"))
+        prefix, full = self._encode(prompt), self._encode(prompt + action_text)
+        prompt_tokens = prefix["input_ids"].shape[1]; output = self.model(**full)
+        logits, ids = output.logits[:, :-1, :], full["input_ids"][:, 1:]
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1).gather(-1, ids.unsqueeze(-1)).squeeze(-1)
+        return log_probs[:, max(0, prompt_tokens - 1):].sum()
+
+    def sample_challenger_action(self, prompt: str, legal_actions: list[dict[str, Any]]):
+        """Sample only from legal actions and retain its differentiable log-P."""
+        if not legal_actions: raise ValueError("challenger has no legal actions")
+        self.load(); torch = self._dependencies()["torch"]
+        scores = torch.stack([self.action_log_probability(prompt, action) for action in legal_actions])
+        distribution = torch.distributions.Categorical(logits=scores)
+        choice = distribution.sample()
+        index = int(choice.item())
+        return {"action": legal_actions[index], "log_probability": distribution.log_prob(choice), "valid": True,
+                "action_index": index, "legal_action_count": len(legal_actions)}
+
+    def _solver_loss(self, example: dict[str, Any]):
+        self.load(); torch = self._dependencies()["torch"]
+        source, target = example["input"], example["target"]
+        prompt = json.dumps(source, sort_keys=True) + "\n<REPAIR>\n"
+        completion = ("<STRATEGY>\n" + target["strategy"] + "\n</STRATEGY>\n<CODE>\n" + target["code"] + "\n</CODE>")
+        encoded, prompt_ids = self._encode(prompt + completion), self._encode(prompt)["input_ids"].shape[1]
+        labels = encoded["input_ids"].clone(); labels[:, :prompt_ids] = -100
+        return self.model(**encoded, labels=labels).loss
+
+    def _step(self, role: str, loss):
+        torch = self._dependencies()["torch"]; optimizer = self.optimizers[role]
+        loss.backward(); torch.nn.utils.clip_grad_norm_(self._role_parameters(role), float(self.model_config.lora.get("max_grad_norm", 1.0)))
+        optimizer.step(); optimizer.zero_grad(set_to_none=True); self.steps[role] += 1
+        return float(loss.detach().cpu())
+
+    def update_solver(self, examples: list[dict[str, Any]]):
+        if not examples: return {"updated": False, "reason": "no verified corrections"}
+        self.load(); self.set_adapter("solver"); losses = [self._solver_loss(example) for example in examples]
+        loss = sum(losses) / len(losses); value = self._step("solver", loss)
+        return {"updated": True, "loss": value, "examples": len(examples), "step": self.steps["solver"], "adapter": self.active_adapter}
+
+    def update_challenger(self, experience: dict[str, Any]):
+        if experience.get("used_fallback") or not experience.get("valid", True) or experience.get("log_probability") is None:
+            return {"updated": False, "reason": "fallback, illegal action, or missing log probability"}
+        self.load(); self.set_adapter("challenger"); reward = experience.get("reward", 0.0)
+        reward = reward["total"] if isinstance(reward, dict) else float(reward)
+        advantage = reward - self.baseline; self.baseline = .9 * self.baseline + .1 * reward
+        value = self._step("challenger", -advantage * experience["log_probability"])
+        return {"updated": True, "loss": value, "reward": reward, "advantage": advantage,
+                "baseline": self.baseline, "step": self.steps["challenger"], "adapter": self.active_adapter}
+
+    def save_checkpoint(self, path: Path):
+        self.load(); path = Path(path); path.mkdir(parents=True, exist_ok=True); torch = self._dependencies()["torch"]
+        for role in self.ROLES:
+            self.model.save_pretrained(path / role, selected_adapters=[role])
+            torch.save(self.optimizers[role].state_dict(), path / f"{role}-optimizer.pt")
+        (path / "trainer.json").write_text(json.dumps({"steps": self.steps, "baseline": self.baseline, "model": asdict(self.model_config)}))
+        return path
+
+    def load_checkpoint(self, path: Path):
+        self.load(); path = Path(path); torch = self._dependencies()["torch"]
+        for role in self.ROLES:
+            self.model.load_adapter(path / role, adapter_name=role, is_trainable=True)
+            self.optimizers[role].load_state_dict(torch.load(path / f"{role}-optimizer.pt", map_location="cpu", weights_only=True))
+        saved = json.loads((path / "trainer.json").read_text()); self.steps = saved["steps"]; self.baseline = saved["baseline"]
+        self.set_adapter("challenger"); return self.health()
+
+    def adapter_state(self, role: str):
+        self.load(); self.set_adapter(role)
+        return {"role": role, "step": self.steps[role], "trainable": sum(p.numel() for p in self._role_parameters(role))}
+
+    def health(self):
+        return {"runtime": "hf-peft", "loaded": self.model is not None, "model_id": self.model_config.model_id,
+                "active_adapter": self.active_adapter, "steps": dict(self.steps), "allow_download": self.allow_download}
 
 
 class EpisodeOrchestrator:
@@ -306,6 +496,9 @@ class EpisodeOrchestrator:
         run.setdefault("episodes", []).append({"episode_id": episode_id, "action": action, "outcome": outcome,
                                                 "challenger_reward": reward, "verified_correction": bool(correction), "updated": updated})
         self.checkpoints.commit_episode(run, episode_id)
+        if not self.evaluation:
+            self.checkpoints.save_trainer(self.trainer, "latest")
+            self.checkpoints.save_trainer(self.trainer, f"milestone-{episode_id:06d}")
         return {"duplicate": False, "updated": updated, "reward": reward, "correction": correction, "outcome": outcome}
 
 
@@ -322,6 +515,11 @@ class Checkpoints:
         for item in old: shutil.rmtree(item)
         return path
     def load_latest(self) -> dict[str, Any]: return json.loads((self.root / "latest/state.json").read_text())
+    def save_trainer(self, trainer: Trainer, name: str = "latest") -> Path:
+        target = self.root / name; target.mkdir(parents=True, exist_ok=True)
+        return trainer.save_checkpoint(target / "trainer")
+    def load_trainer(self, trainer: Trainer, name: str = "latest"):
+        return trainer.load_checkpoint(self.root / name / "trainer")
 
 
 def manifest(model: ModelConfig, train_manifest: Any, eval_manifest: Any, **extra: Any) -> dict[str, Any]:
