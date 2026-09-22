@@ -51,6 +51,75 @@ class FakeModel:
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_curriculum_actions_are_bounded_and_invalid_sample_is_not_credited(self):
+        curriculum = experiment.Curriculum(['cache'])
+        class Trainer:
+            def sample_challenger_action(self, prompt, legal):
+                self.legal = legal
+                return {'action': {'benchmark': 'cache', 'difficulty': 99}}
+        trainer = Trainer()
+        model = SimpleNamespace(trainer=trainer)
+        action, evidence = experiment.choose_curriculum_action(model, curriculum, 'cache', 'x')
+        self.assertEqual(trainer.legal, curriculum.legal_actions('cache'))
+        self.assertTrue(evidence['used_fallback']); self.assertFalse(evidence['action_valid'])
+        self.assertEqual(action, curriculum.fallback('cache'))
+        challenge = experiment.challenge_from_action(experiment.CacheBenchmark(), action, 7)
+        self.assertTrue(experiment.CacheBenchmark().validate_challenge(challenge)[0])
+        self.assertEqual(len(evidence['invalid_proposals']), 1)
+
+    def test_sealed_manifest_is_stable_and_detects_tampering(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'eval.json'
+            judge = {'cpus': 1, 'memory_mb': 256, 'pids': 64, 'tmpfs_mb': 128,
+                     'timeout_seconds': 3, 'output_bytes': 65536}
+            first = experiment.create_eval_manifest(path, 42, 3, judge)
+            second = experiment.load_eval_manifest(path)
+            self.assertEqual(first, second)
+            altered = dict(second); altered['entries'] = list(second['entries']); altered['entries'][0] = dict(altered['entries'][0])
+            altered['entries'][0]['challenge'] = dict(altered['entries'][0]['challenge'])
+            altered['entries'][0]['challenge']['seed'] += 1
+            path.write_text(json.dumps(altered))
+            with self.assertRaises(ValueError): experiment.load_eval_manifest(path)
+
+    def test_neural_repair_updates_only_verified_improvement(self):
+        class RepairBenchmark(FakeBenchmark):
+            def evaluate(self, files, challenge, config):
+                passed = 'good' in files.get('solution.c', '')
+                return {'started_at': experiment.now(), 'finished_at': experiment.now(), 'accepted': passed,
+                        'build': {'exit_code': 0, 'stdout': '', 'stderr': ''},
+                        'correctness': {'passed': int(passed), 'total': 1, 'cases': []},
+                        'performance': {'median_ms': 100},
+                        'reward_inputs': {'solver_reward': float(passed), 'challenger_reward': float(not passed)},
+                        'feedback': 'pass' if passed else 'fail'}
+        class NeuralTrainer:
+            def __init__(self): self.updates = []; self.calls = 0
+            def sample_challenger_action(self, prompt, legal): return {'action': legal[0], 'valid': True}
+            def generate(self, role, prompt, config):
+                self.calls += 1
+                code = 'int main(void){return 1;} /* bad */' if self.calls == 1 else 'int main(void){return 0;} /* good */'
+                return {'text': json.dumps({'summary': 'repair', 'changes': [{'path': 'solution.c', 'content': code}]}), 'tokens': 9}
+            def update_challenger(self, value): self.updates.append(('challenger', value)); return {'updated': True}
+            def update_solver(self, value): self.updates.append(('solver', value)); return {'updated': True}
+            def save_checkpoint(self, path): return path
+            def finalize(self): return {}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); repo = root / 'repo'; repo.mkdir(); subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            (repo / 'README').write_text('x'); spec = repo / 'docs/benchmarks/compression/SPEC.md'; spec.parent.mkdir(parents=True); spec.write_text('Return zero.')
+            env = os.environ | {'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com', 'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com'}
+            subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True); subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'initial'], check=True, env=env)
+            args = SimpleNamespace(root=root / 'runs', run_id='repair', seed=1, hours=None, episodes=1, resume=False,
+                benchmarks='compression', cpus=1, selection_mode='adaptive', memory_mb=256, pids=64, tmpfs_mb=128,
+                timeout_seconds=3, output_bytes=65536, soft_gb=.1, hard_gb=.2, challenger_tokens=10, solver_tokens=50,
+                solver_attempts=3, evaluation=False, trainer_backend='remote')
+            trainer = NeuralTrainer()
+            with patch.object(experiment, 'ROOT', repo), patch.dict(experiment.TRAIN, {'compression': RepairBenchmark}), patch.dict(os.environ, env):
+                experiment.run(args, experiment.TrainerModel(trainer))
+            record = json.loads((args.root / 'repair' / '000001.json').read_text())
+            self.assertEqual(len(record['solver']['attempts']), 2)
+            self.assertEqual([kind for kind, _ in trainer.updates], ['challenger', 'solver'])
+            self.assertIn('bad', trainer.updates[1][1][0]['input']['code'])
+            self.assertIn('good', trainer.updates[1][1][0]['target']['code'])
+
     def test_production_backend_routes_generation_updates_checkpoint_and_eval_through_trainer(self):
         class RecordingTrainer(MockTrainer):
             def __init__(self):

@@ -487,7 +487,8 @@ class HFPEFTTrainer:
             if role == "base":
                 with self.model.disable_adapter(): output = generate()
             else: output = generate()
-        return self.tokenizer.decode(output[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        generated = output[0, inputs["input_ids"].shape[1]:]
+        return {"text": self.tokenizer.decode(generated, skip_special_tokens=True), "tokens": int(generated.shape[0])}
 
     def action_log_probability(self, prompt: str, action: dict[str, Any]):
         """Differentiable log P(action JSON | prompt), retained for REINFORCE."""
@@ -507,7 +508,8 @@ class HFPEFTTrainer:
         distribution = torch.distributions.Categorical(logits=scores)
         choice = distribution.sample()
         index = int(choice.item())
-        return {"action": legal_actions[index], "log_probability": distribution.log_prob(choice), "valid": True,
+        # The sampled tensor cannot cross the remote boundary; update recomputes it from prompt/action.
+        return {"action": legal_actions[index], "log_probability": None, "valid": True,
                 "action_index": index, "legal_action_count": len(legal_actions)}
 
     def _solver_loss(self, example: dict[str, Any]):

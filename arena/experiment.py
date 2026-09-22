@@ -10,6 +10,7 @@ import re
 import signal
 import subprocess
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,7 +30,9 @@ from .evidence import viewer_events, write_episode
 from .experiment_context import apply_changes, parse_object, parse_solver_response, selected_context, source_diff
 from .sandbox import SandboxConfig
 from .marl import choose_action, init_q, q_update, rolling_average, skill_state, challenger_reward as frontier_reward
-from .training import PRODUCTION_MODEL, HFPEFTTrainer, MockTrainer, ModelConfig, RemoteTrainer, RemoteTrainerConfig
+from .training import (PRODUCTION_MODEL, BenchmarkProgress, Curriculum, HFPEFTTrainer, MockTrainer,
+                       ModelConfig, RemoteTrainer, RemoteTrainerConfig, SolverResponse, failure_feedback,
+                       reference_identity, verified_correction, challenger_reward as curriculum_reward)
 
 TRAIN = {'compression': CompressionBenchmark, 'csv': CsvBenchmark, 'http': HttpBenchmark,
          'expression': ExpressionBenchmark, 'graph': GraphBenchmark}
@@ -180,6 +183,88 @@ def select_benchmark(state: dict):
     return name, performance_state, rng.getstate()
 
 
+def curriculum_from_state(state: dict) -> Curriculum:
+    curriculum = Curriculum(state['benchmarks'])
+    saved = state.get('curriculum')
+    if saved:
+        curriculum.progress = {name: BenchmarkProgress(**saved['progress'][name]) for name in state['benchmarks']}
+        curriculum.by_level = {name: {int(level): trials for level, trials in levels.items()}
+                               for name, levels in saved['by_level'].items()}
+    return curriculum
+
+
+def curriculum_state(curriculum: Curriculum) -> dict:
+    return {'progress': {name: asdict(value) for name, value in curriculum.progress.items()},
+            'by_level': curriculum.by_level}
+
+
+def challenge_from_action(benchmark, action: dict, seed: int) -> dict:
+    """Deterministic, mechanically-valid curriculum action translation."""
+    challenge = benchmark.initialize(seed)
+    level = action['difficulty']
+    # The validation tasks are held out, but levels still select bounded workload knobs.
+    if getattr(benchmark, 'name', '') == 'cache':
+        challenge.update(capacity=min(128, 4 * level), operations=min(1000, 30 * level),
+                         keys=min(256, 8 * level), distribution=('uniform', 'hot', 'sequential')[(level - 1) % 3])
+    elif getattr(benchmark, 'name', '') == 'log':
+        challenge.update(records=min(10000, 100 * level), malformed=min(100, level - 1),
+                         distribution=('uniform', 'bursty')[(level - 1) % 2],
+                         query=('count', 'by_level', 'filter')[(level - 1) % 3])
+    elif getattr(benchmark, 'name', '') == 'search':
+        challenge.update(documents=min(1000, 20 * level), queries=min(30, 4 + level),
+                         words_per_doc=min(100, 10 * level),
+                         distribution=('uniform', 'skewed')[(level - 1) % 2], matching=('exact', 'prefix')[(level - 1) % 2])
+    valid, reason = benchmark.validate_challenge(challenge)
+    if not valid: raise ValueError(f'curriculum produced invalid challenge: {reason}')
+    return challenge
+
+
+def create_eval_manifest(path: Path, seed: int, solver_attempts: int, judge: dict) -> dict:
+    """Seal the held-out cache/log/search inputs before either comparison."""
+    entries = []
+    reference = (ROOT / 'references' / 'c-library.md').read_text()
+    for index, name in enumerate(('cache', 'log', 'search'), 1):
+        challenge_seed = (seed + index * 1009) % (2**32)
+        benchmark = VALIDATION[name]()
+        challenge = benchmark.initialize(challenge_seed)
+        valid, reason = benchmark.validate_challenge(challenge)
+        if not valid: raise ValueError(f'invalid evaluation challenge: {name}: {reason}')
+        spec = (ROOT / 'docs' / 'benchmarks' / name / 'SPEC.md').read_text()
+        entries.append({'benchmark': name, 'challenge': challenge,
+                        'seeds': {'challenge': challenge_seed, 'solver_model': challenge_seed + 500000},
+                        'reference': reference_identity(reference, 'references/c-library.md'),
+                        'spec_sha256': hashlib.sha256(spec.encode()).hexdigest()})
+    manifest = {'version': 1, 'entries': entries, 'solver_attempts': solver_attempts,
+                'protocol': 'experiment-solver-json-v1', 'judge': judge}
+    manifest['sha256'] = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    atomic_json(path, manifest)
+    return manifest
+
+
+def load_eval_manifest(path: Path) -> dict:
+    manifest = json.loads(path.read_text())
+    claimed = manifest.pop('sha256', None)
+    actual = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    manifest['sha256'] = claimed
+    if claimed != actual or not isinstance(manifest.get('entries'), list) or not manifest['entries']:
+        raise ValueError('invalid sealed evaluation manifest')
+    return manifest
+
+
+def choose_curriculum_action(model: TrainerModel, curriculum: Curriculum, benchmark: str, prompt: str):
+    legal = curriculum.legal_actions(benchmark)
+    sampled = model.trainer.sample_challenger_action(prompt, legal)
+    action = sampled.get('action') if isinstance(sampled, dict) else None
+    valid, reason = curriculum.validate(action)
+    if action not in legal:
+        valid, reason = False, 'action was not one of the supplied legal actions'
+    used_fallback = not valid
+    if used_fallback: action = curriculum.fallback(benchmark)
+    evidence = {'legal_actions': legal, 'sampled': sampled, 'action_valid': valid,
+                'used_fallback': used_fallback, 'invalid_proposals': ([] if valid else [{'proposal': sampled, 'error': reason}])}
+    return action, evidence
+
+
 def project_files(workspace: Path, benchmark: str):
     root = workspace / 'solutions' / benchmark
     return {str(path.relative_to(root)): path.read_text() for path in sorted(root.rglob('*'))
@@ -317,6 +402,12 @@ def synthetic_failure(benchmark, challenge, reason):
             'feedback': reason[:1000], 'accepted': False}
 
 
+def judge_candidate(benchmark, files: dict[str, str], challenge: dict, config: SandboxConfig):
+    """Training benchmarks consume files; held-out C benchmarks consume solution.c."""
+    source = files.get('solution.c', '') if getattr(benchmark, 'name', '') in VALIDATION else files
+    return benchmark.evaluate(source, challenge, config)
+
+
 def prepare_run(run_dir: Path, run_id: str, seed: int, model_revision: str, hours: float | None,
                 benchmarks: list[str], config: dict, resume: bool):
     state_path = run_dir / 'state.json'
@@ -446,13 +537,14 @@ def choose_challenge(model, benchmark, public_spec: str, seed: int, memory: list
 
 
 def solve(model, public_spec: str, challenge: dict, files: dict[str, str], memory: list[str],
-          latest_diff: str, failures: str, seed: int, max_tokens: int):
+          latest_diff: str, failures: str, seed: int, max_tokens: int, reference: str = ''):
     context, reads = selected_context(files, challenge, latest_diff, failures, ROOT / 'references')
     system = ('You are a C programmer. Produce candidate source for TinyCC. '
               'No external libraries or network. Choose your own implementation.')
     user = (f'Public specification:\n{public_spec[:5500]}\n'
             f'Accepted source context:\n{context}\n'
             f'Previous Judge feedback: {failures[:800]}\n'
+            f'C reference:\n{reference[:6000]}\n'
             f'Your last five notes (may be wrong): {json.dumps(memory[-5:])[:1000]}\n\n'
             f'Now solve this validated challenge: {json.dumps(challenge)}\n'
             'Reply with changed files as JSON: {"summary":"short decision",'
@@ -488,9 +580,13 @@ def solve(model, public_spec: str, challenge: dict, files: dict[str, str], memor
 
 
 def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxConfig,
-            challenger_tokens: int, solver_tokens: int):
+            challenger_tokens: int, solver_tokens: int, solver_attempts: int = 1):
     number = state['episode'] + 1
-    name, performance_state, next_rng_state = select_benchmark(state)
+    neural = isinstance(model, TrainerModel) and hasattr(model.trainer, 'sample_challenger_action')
+    eval_entry = state.get('eval_manifest_entries', [])[state['episode']] if state.get('eval_manifest_entries') else None
+    # Neural Challenger selects difficulty, not an arbitrary benchmark parameter object.
+    name, performance_state, next_rng_state = ((eval_entry['benchmark'], None, None) if eval_entry else
+        ((state['benchmarks'][state['episode'] % len(state['benchmarks'])], None, None) if neural else select_benchmark(state)))
     benchmark = TRAIN.get(name, VALIDATION.get(name))()
     seed = (state['seed'] + number * 1009) % (2**32)
     spec = (ROOT / 'docs/benchmarks' / name / 'SPEC.md').read_text()
@@ -501,29 +597,57 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
                        'outcome': item['outcome'], 'correctness': item['correctness']['passed'],
                        'total': item['correctness']['total'],
                        'performance': primary_ms(item)})
-    challenge, rationale, invalid, challenger_gen = choose_challenge(
-        model, benchmark, spec, seed, state['challenger_memory'], recent, challenger_tokens)
+    curriculum = curriculum_from_state(state) if neural else None
+    if eval_entry:
+        action, challenger_evidence, challenger_gen = None, {'action_valid': False, 'used_fallback': True, 'invalid_proposals': []}, None
+        challenge, rationale, invalid = eval_entry['challenge'], 'Sealed evaluation manifest', []
+        seed = eval_entry['seeds']['challenge']
+        solver_attempts = state.get('eval_solver_attempts', solver_attempts)
+    elif neural:
+        action_prompt = f'Choose one legal curriculum action only. Benchmark: {name}. Recent judge outcomes: {json.dumps(recent[-3:])}'
+        action, challenger_evidence = choose_curriculum_action(model, curriculum, name, action_prompt)
+        challenge, rationale = challenge_from_action(benchmark, action, seed), f'Curriculum action {action}'
+        invalid, challenger_gen = challenger_evidence['invalid_proposals'], challenger_evidence['sampled']
+    else:
+        action, challenger_evidence = None, None
+        challenge, rationale, invalid, challenger_gen = choose_challenge(
+            model, benchmark, spec, seed, state['challenger_memory'], recent, challenger_tokens)
     atomic_json(run_dir / 'pending.json', {'ready': False, 'episode_id': number,
                                            'challenge': challenge, 'rationale': rationale,
                                            'challenger_generation': challenger_gen})
     before = project_files(workspace, name)
     latest_diff = git('show', '--format=', '--', f'solutions/{name}', cwd=workspace)[:1500]
     failures = '\n'.join(x['feedback'] for x in recent if x['outcome'] == 'rejected')
+    attempts, attempt_evidence = [], []
+    reference_text = before.get('solution.c', '')
+    reference = reference_identity(reference_text, 'accepted-source')
+    candidate, changed, summary, response, reads, solver_gen = before, [], '', '', [], {}
+    result = synthetic_failure(benchmark, challenge, 'Solver made no attempt')
+    feedback = failures
+    for attempt_number in range(1, max(1, solver_attempts) + 1):
+        try:
+            candidate, changed, summary, response, reads, solver_gen = solve(
+                model, spec, challenge, before, state['solver_memory'], latest_diff, feedback,
+                seed + 500000 + attempt_number - 1, solver_tokens, reference_text)
+            result = (synthetic_failure(benchmark, challenge, 'Invalid Solver response: ' + solver_gen['error'])
+                      if solver_gen.get('error') else judge_candidate(benchmark, candidate, challenge, config))
+        except (ValueError, KeyError, TypeError, RuntimeError, TimeoutError) as err:
+            candidate, changed, summary, response, reads, solver_gen = before, [], '', str(err), [], {}
+            result = synthetic_failure(benchmark, challenge, f'Invalid Solver response: {err}')
+        contract = SolverResponse(summary, [], {}, candidate.get('solution.c', ''), solver_gen.get('error'))
+        feedback_data = failure_feedback(challenge, contract, result, reference)
+        attempts.append((contract, result, feedback_data))
+        attempt_evidence.append({'attempt': attempt_number, 'response': response[:3 * 1024 * 1024],
+                                 'candidate': json.dumps(candidate, sort_keys=True, ensure_ascii=False),
+                                 'files_changed': changed, 'generation': solver_gen, 'judge': result,
+                                 'feedback': feedback_data, 'reference': reference, 'reference_reads': reads})
+        if result.get('accepted'): break
+        feedback = json.dumps(feedback_data, sort_keys=True)
+    atomic_json(run_dir / 'pending.json', {'ready': False, 'episode_id': number,
+                                           'challenge': challenge, 'rationale': rationale,
+                                           'solver_attempts': attempt_evidence})
     try:
-        candidate, changed, summary, response, reads, solver_gen = solve(
-            model, spec, challenge, before, state['solver_memory'], latest_diff, failures,
-            seed + 500000, solver_tokens)
-        atomic_json(run_dir / 'pending.json', {'ready': False, 'episode_id': number,
-                                               'challenge': challenge, 'rationale': rationale,
-                                               'solver_response': response[:3 * 1024 * 1024],
-                                               'candidate': candidate})
-        result = (synthetic_failure(benchmark, challenge, 'Invalid Solver response: ' + solver_gen['error'])
-                  if solver_gen.get('error') else benchmark.evaluate(candidate, challenge, config))
-    except (ValueError, KeyError, TypeError, RuntimeError, TimeoutError) as err:
-        candidate, changed, summary, response, reads, solver_gen = before, [], '', str(err), [], {}
-        result = synthetic_failure(benchmark, challenge, f'Invalid Solver response: {err}')
-    try:
-        baseline = benchmark.evaluate(before, challenge, config) if before and changed else None
+        baseline = judge_candidate(benchmark, before, challenge, config) if before and changed else None
     except (RuntimeError, TimeoutError, OSError) as err:
         baseline = synthetic_failure(benchmark, challenge, f'Baseline Judge failed: {err}')
         result['accepted'] = False
@@ -538,7 +662,7 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
             if old_challenge == challenge:
                 continue
             try:
-                check = benchmark.evaluate(candidate, old_challenge, config)
+                check = judge_candidate(benchmark, candidate, old_challenge, config)
             except (RuntimeError, TimeoutError, OSError) as err:
                 check = synthetic_failure(benchmark, old_challenge, f'Replay Judge failed: {err}')
             replay.append({'episode_id': old['episode_id'], 'challenge': old_challenge,
@@ -553,23 +677,41 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
     solver_reward = float(result['reward_inputs']['solver_reward'])
     challenger_reward = float(result['reward_inputs']['challenger_reward'])
     trainer_updates = []
-    if isinstance(model, TrainerModel) and not model.evaluation:
-        # Judge-verification is the trust boundary for the compact correction.
+    correction = verified_correction(attempts)
+    if neural and not model.evaluation:
+        outcome = {'fraction': result['correctness']['passed'] / max(1, result['correctness']['total']),
+                   'success': bool(result['accepted']), 'compiled': result['build'].get('exit_code') == 0,
+                   'first_success': bool(attempts and attempts[0][1].get('accepted')),
+                   'repair_success': len(attempts) > 1 and bool(result['accepted']) and not attempts[0][1].get('accepted')}
+        reward = curriculum_reward(challenger_evidence['action_valid'], challenger_evidence['used_fallback'], outcome,
+                                   action['difficulty'] - curriculum.progress[name].frontier)
+        if challenger_evidence['action_valid'] and not challenger_evidence['used_fallback']:
+            curriculum.record(name, action['difficulty'], outcome)
+        challenger = model.trainer.update_challenger({"episode_id": number, "valid": challenger_evidence['action_valid'],
+            "used_fallback": challenger_evidence['used_fallback'], "prompt": action_prompt, "action": action,
+            "log_probability": challenger_gen.get('log_probability') if isinstance(challenger_gen, dict) else None, "reward": reward})
+        trainer_updates.append({"role": "challenger", **(challenger if isinstance(challenger, dict) else {})})
+        if correction:
+            correction = {**correction, "episode_id": number, "challenge": challenge, "verified": True}
+            solver_update = model.trainer.update_solver([correction])
+            trainer_updates.append({"role": "solver", **(solver_update if isinstance(solver_update, dict) else {})})
+    elif isinstance(model, TrainerModel) and not model.evaluation:
         challenger = model.trainer.update_challenger({"episode_id": number, "valid": True,
             "prompt": model.prompts.get("challenger", ""), "action": challenge, "reward": challenger_reward})
         trainer_updates.append({"role": "challenger", **(challenger if isinstance(challenger, dict) else {})})
         if changed and result['accepted']:
-            correction = {"episode_id": number, "input": {"challenge": challenge, "feedback": result['feedback']},
-                          "target": {"strategy": summary, "code": candidate.get('solution.c', '')}, "verified": True}
-            solver_update = model.trainer.update_solver([correction])
+            legacy_correction = {"episode_id": number, "input": {"challenge": challenge, "feedback": result['feedback']},
+                                 "target": {"strategy": summary, "code": candidate.get('solution.c', '')}, "verified": True}
+            solver_update = model.trainer.update_solver([legacy_correction])
             trainer_updates.append({"role": "solver", **(solver_update if isinstance(solver_update, dict) else {})})
     solver_memory = push_memory(state['solver_memory'],
         f'{name}: {summary}; Judge {result["feedback"]}; {reason}; files {", ".join(changed)}')
     challenger_memory = push_memory(state['challenger_memory'],
         f'{name}: {rationale}; Solver {summary}; Judge {result["feedback"]}; {reason}', 500)
     next_state = dict(state)
-    next_state.update({'episode': number, 'solver_memory': solver_memory,
-                       'challenger_memory': challenger_memory})
+    next_state.update({'episode': number, 'solver_memory': state['solver_memory'] if getattr(model, 'evaluation', False) else solver_memory,
+                       'challenger_memory': state['challenger_memory'] if getattr(model, 'evaluation', False) else challenger_memory})
+    if neural and not model.evaluation: next_state['curriculum'] = curriculum_state(curriculum)
     next_state['selection_counts'] = dict(state['selection_counts'])
     next_state['selection_counts'][name] += 1
     policy_reward = frontier_reward(result['correctness']['passed'] / max(1, result['correctness']['total']))
@@ -577,7 +719,7 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
         policy_reward = 0.0
     next_state['performance_history'] = (state['performance_history'] +
                                          [result['correctness']['passed'] / max(1, result['correctness']['total'])])[-3:]
-    if performance_state is not None:
+    if performance_state is not None and not neural:
         next_state['Q_challenger'] = {key: dict(row) for key, row in state['Q_challenger'].items()}
         next_state['policy_rng_state'] = next_rng_state
         next_performance_state = skill_state(rolling_average(next_state['performance_history']))
@@ -590,13 +732,14 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
               'git_before': state['accepted_head'],
               'challenger': {'request': challenge, 'rationale': rationale, 'invalid_proposals': invalid,
                              'memory_before': state['challenger_memory'], 'memory_after': challenger_memory,
-                             'generation': challenger_gen},
+                             'generation': challenger_gen, 'action': action, 'action_evidence': challenger_evidence},
               'solver': {'response': response[:3 * 1024 * 1024], 'summary': summary,
                          'candidate': candidate_text, 'patch': patch, 'files_changed': changed,
                          'memory_before': state['solver_memory'], 'memory_after': solver_memory,
-                         'generation': solver_gen},
+                         'generation': solver_gen, 'attempts': attempt_evidence,
+                         'verified_correction': correction},
               'reference_reads': reads,
-              'selection_policy': {'mode': state['selection_mode'], 'state': performance_state,
+              'selection_policy': {'mode': 'curriculum' if neural else state['selection_mode'], 'state': performance_state,
                                    'action': name, 'frontier_reward': policy_reward,
                                    'q_before': state['Q_challenger'],
                                    'q_after': next_state['Q_challenger']},
@@ -666,8 +809,18 @@ def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
                            output_bytes=min(args.output_bytes, 1024 * 1024))
     state, workspace = prepare_run(run_dir, args.run_id, args.seed, model.revision, args.hours,
                                    names, vars(args) | {'root': str(args.root)}, args.resume)
+    if getattr(args, 'eval_manifest', None):
+        manifest = load_eval_manifest(args.eval_manifest)
+        if not getattr(args, 'evaluation', False): raise ValueError('--eval-manifest requires --evaluation')
+        if manifest['judge'] != {'cpus': args.cpus, 'memory_mb': args.memory_mb, 'pids': args.pids,
+                                 'tmpfs_mb': args.tmpfs_mb, 'timeout_seconds': args.timeout_seconds,
+                                 'output_bytes': min(args.output_bytes, 1024 * 1024)}:
+            raise ValueError('evaluation judge settings differ from sealed manifest')
+        state['eval_manifest_entries'] = manifest['entries']
+        state['eval_solver_attempts'] = manifest['solver_attempts']
+        if args.episodes is None or args.episodes > len(manifest['entries']): args.episodes = len(manifest['entries'])
     state = reconcile(run_dir, state, workspace)
-    if isinstance(model, TrainerModel) and args.resume:
+    if isinstance(model, TrainerModel) and (args.resume or getattr(args, 'remote_checkpoint', None)):
         model.trainer.load_checkpoint(getattr(args, 'remote_checkpoint', None) or "latest")
     shutdown = shutdown or ShutdownController()
     shutdown.install()
@@ -684,7 +837,7 @@ def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
                 if run_bytes(run_dir, state, workspace) >= hard:
                     break
             state = episode(model, state, workspace, run_dir, config,
-                            args.challenger_tokens, args.solver_tokens)
+                            args.challenger_tokens, args.solver_tokens, getattr(args, 'solver_attempts', 1))
             if isinstance(model, TrainerModel) and not model.evaluation:
                 model.trainer.save_checkpoint("latest")
             git_progress(state, workspace)
@@ -730,12 +883,15 @@ def main(argv=None):
     parser.add_argument('--hf-push-every', type=int, default=5)
     parser.add_argument('--hf-resume-push-every', type=int, default=10)
     parser.add_argument('--evaluation', action='store_true', help='generation-only mode; no trainer updates or checkpoints')
+    parser.add_argument('--eval-manifest', type=Path, help='sealed held-out manifest; requires --evaluation')
+    parser.add_argument('--create-eval-manifest', type=Path, help='write deterministic cache/log/search manifest and exit')
     parser.add_argument('--adapter-mode', choices=('base', 'trained'), default='trained', help='use disabled adapters for the BASE comparison')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--benchmarks', default=','.join(TRAIN))
     parser.add_argument('--selection-mode', choices=('adaptive', 'round_robin'), default='adaptive')
     parser.add_argument('--challenger-tokens', type=int, default=600)
     parser.add_argument('--solver-tokens', type=int, default=2500)
+    parser.add_argument('--solver-attempts', type=int, default=3, help='bounded Solver correction attempts (A100 default: 3)')
     parser.add_argument('--soft-gb', type=float, default=15)
     parser.add_argument('--hard-gb', type=float, default=20)
     parser.add_argument('--cpus', type=float, default=1)
@@ -745,6 +901,12 @@ def main(argv=None):
     parser.add_argument('--timeout-seconds', type=int, default=3)
     parser.add_argument('--output-bytes', type=int, default=1024 * 1024)
     args = parser.parse_args(argv)
+    if args.create_eval_manifest:
+        create_eval_manifest(args.create_eval_manifest, args.seed, args.solver_attempts,
+                             {'cpus': args.cpus, 'memory_mb': args.memory_mb, 'pids': args.pids,
+                              'tmpfs_mb': args.tmpfs_mb, 'timeout_seconds': args.timeout_seconds,
+                              'output_bytes': min(args.output_bytes, 1024 * 1024)})
+        return
     if args.preflight:
         if args.trainer_backend != 'legacy':
             trainer = configured_trainer(args)

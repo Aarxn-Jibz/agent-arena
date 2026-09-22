@@ -89,7 +89,8 @@ class ArenaTrainerService:
         if op == "generate":
             role = request.get("role")
             if role not in self.trainer.ROLES + ("base",) or not isinstance(request.get("prompt"), str): _error("invalid_request", "role and prompt are required")
-            return {"ok": True, "result": {"text": self.trainer.generate(role, request["prompt"], request.get("generation_config", {}))}}
+            generated = self.trainer.generate(role, request["prompt"], request.get("generation_config", {}))
+            return {"ok": True, "result": generated if isinstance(generated, dict) else {"text": generated, "tokens": 0}}
         if op == "sample_challenger_action":
             return {"ok": True, "result": self.trainer.sample_challenger_action(request.get("prompt", ""), request.get("legal_actions", []))}
         if op in ("update_solver", "update_challenger"):
