@@ -143,6 +143,15 @@ def git_progress(state: dict, workspace: Path | None = None, *, final: bool = Fa
         return False
 
 
+def is_progress_head(state: dict, workspace: Path, head: str) -> bool:
+    if git('rev-parse', 'HEAD^', cwd=workspace) != state['accepted_head']:
+        return False
+    message = git('log', '-1', '--format=%B', head, cwd=workspace)
+    files = git('diff-tree', '--no-commit-id', '--name-only', '-r', head, cwd=workspace).splitlines()
+    return (bool(re.fullmatch(rf'experiment\({re.escape(state["run_id"])}\): episodes \d+-{state["episode"]}', message))
+            and files == [f'experiment-progress/{state["run_id"]}.json'])
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -485,7 +494,10 @@ def reconcile(run_dir: Path, state: dict, workspace: Path):
     pending = run_dir / 'pending.json'
     if not pending.exists():
         if git('rev-parse', 'HEAD', cwd=workspace) != state['accepted_head']:
-            raise RuntimeError('accepted worktree changed outside experiment')
+            head = git('rev-parse', 'HEAD', cwd=workspace)
+            if not is_progress_head(state, workspace, head):
+                raise RuntimeError('accepted worktree changed outside experiment')
+            state = dict(state); state['accepted_head'] = head; atomic_json(run_dir / 'state.json', state)
         rebuild_events(run_dir)
         return state
     transaction = json.loads(pending.read_text())
@@ -503,7 +515,7 @@ def reconcile(run_dir: Path, state: dict, workspace: Path):
                   git('log', '-1', '--format=%B', cwd=workspace) != transaction['commit_message']):
                 raise RuntimeError('unexpected accepted commit during recovery')
             record['git_after'] = head
-        elif head != state['accepted_head']:
+        elif head != state['accepted_head'] and not is_progress_head(state, workspace, head):
             raise RuntimeError('unexpected Git HEAD during rejected episode')
         if not (run_dir / f'{episode:06d}.json').exists():
             write_episode(run_dir.parent, record)
@@ -852,7 +864,11 @@ def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
                             args.challenger_tokens, args.solver_tokens, getattr(args, 'solver_attempts', 1))
             if isinstance(model, TrainerModel) and not model.evaluation:
                 model.trainer.save_checkpoint("latest")
+            atomic_json(run_dir / 'state.json', state)
             git_progress(state, workspace)
+            head = git('rev-parse', 'HEAD', cwd=workspace)
+            if head != state['accepted_head'] and is_progress_head(state, workspace, head):
+                state['accepted_head'] = head
             atomic_json(run_dir / 'state.json', state)
             if run_bytes(run_dir, state, workspace) >= hard:
                 print('Hard artifact quota reached after episode; checkpointed.', flush=True)
@@ -869,6 +885,9 @@ def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
                 state['trainer_final_publish_error'] = type(err).__name__
         if shutdown.requested:
             git_progress(state, workspace, final=True)
+            head = git('rev-parse', 'HEAD', cwd=workspace)
+            if head != state['accepted_head'] and is_progress_head(state, workspace, head):
+                state['accepted_head'] = head
             atomic_json(run_dir / 'state.json', state)
         shutdown.restore()
     return state

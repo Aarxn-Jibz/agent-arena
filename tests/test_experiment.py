@@ -278,6 +278,36 @@ class ExperimentTests(unittest.TestCase):
             with patch.object(experiment.subprocess, 'run') as call:
                 self.assertFalse(experiment.git_progress(state)); call.assert_not_called()
 
+    def test_progress_commit_after_rejected_boundary_reconciles_and_allows_next_episode(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); repo, remote, run_dir = root / 'repo', root / 'remote.git', root / 'runs' / 'night'
+            repo.mkdir(); subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            (repo / 'README').write_text('test')
+            env = os.environ | {'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+                                'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com'}
+            subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+            subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'initial'], check=True, env=env)
+            subprocess.run(['git', '-C', str(repo), 'checkout', '-qb', 'experiment/night'], check=True)
+            subprocess.run(['git', 'init', '--bare', '-q', str(remote)], check=True)
+            subprocess.run(['git', '-C', str(repo), 'remote', 'add', 'origin', str(remote)], check=True)
+            head = experiment.git('rev-parse', 'HEAD', cwd=repo)
+            state = {'run_id': 'night', 'episode': 5, 'accepted_head': head, 'git_push_every': 5,
+                     'last_git_progress_episode': 0, 'last_git_commit_episode': 0, 'status': 'running',
+                     'branch': 'experiment/night'}
+            with patch.dict(os.environ, env):
+                self.assertTrue(experiment.git_progress(state, repo))
+            progress_head = experiment.git('rev-parse', 'HEAD', cwd=repo)
+            self.assertNotEqual(progress_head, head)
+            run_dir.mkdir(parents=True); experiment.atomic_json(run_dir / 'state.json', state)
+            (run_dir / '000006.json').write_text('{}')
+            experiment.atomic_json(run_dir / 'pending.json', {'ready': True, 'episode_id': 6,
+                'record': {'outcome': 'rejected'}, 'next_state': dict(state) | {'episode': 6}})
+            with patch.object(experiment, 'safe_report'):
+                recovered = experiment.reconcile(run_dir, state, repo)
+                self.assertEqual(recovered['episode'], 6)
+                self.assertEqual(recovered['accepted_head'], progress_head)
+                self.assertEqual(experiment.reconcile(run_dir, recovered, repo), recovered)
+
     def test_final_progress_push_is_only_after_safe_episode_boundary(self):
         controller = experiment.ShutdownController()
         events = []
