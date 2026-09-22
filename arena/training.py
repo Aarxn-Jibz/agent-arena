@@ -14,6 +14,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -36,6 +39,12 @@ class ModelConfig:
 
 def production_model_config() -> ModelConfig:
     return ModelConfig()
+
+
+def publish_schedule(episode: int, push_every: int, resume_push_every: int, *, final: bool = False) -> dict[str, bool]:
+    """Pure schedule used by the remote service; zero disables periodic uploads."""
+    adapters = final or (push_every > 0 and episode > 0 and episode % push_every == 0)
+    return {"adapters": adapters, "full_resume": final or (resume_push_every > 0 and episode > 0 and episode % resume_push_every == 0)}
 
 
 def _version(name: str) -> str | None:
@@ -261,6 +270,86 @@ class Trainer(Protocol):
     def health(self) -> dict[str, Any]: ...
 
 
+class RemoteTrainerError(RuntimeError):
+    """A structured failure returned by the trainer service."""
+    def __init__(self, kind: str, message: str, *, status: int | None = None, detail: Any = None):
+        super().__init__(message); self.kind, self.status, self.detail = kind, status, detail
+
+
+@dataclass(frozen=True)
+class RemoteTrainerConfig:
+    url: str
+    token: str
+    run_id: str
+    model_id: str = PRODUCTION_MODEL
+    revision: str | None = None
+    timeout: float = 120.0
+    retries: int = 2
+    hf_repo: str | None = None
+    hf_push_every: int = 5
+    hf_resume_push_every: int = 10
+
+
+class RemoteTrainer:
+    """HTTPS transport for a long-lived Modal ``HFPEFTTrainer`` service.
+
+    The standard-library client deliberately sends only prompts, corrections,
+    rewards, and identifiers; weights never cross this boundary.
+    """
+    ROLES = ("challenger", "solver")
+    def __init__(self, config: RemoteTrainerConfig, *, opener=None):
+        if not config.url.startswith(("https://", "http://")): raise ValueError("remote trainer URL must be HTTP(S)")
+        if not config.token: raise ValueError("remote trainer token is required")
+        if not config.run_id: raise ValueError("remote trainer run_id is required")
+        self.config, self._open, self._episode = config, opener or urllib.request.urlopen, 0
+
+    def _request(self, operation: str, body: dict[str, Any], *, mutable: bool = False):
+        payload = {"run_id": self.config.run_id, "model_id": self.config.model_id,
+                   "revision": self.config.revision, "operation": operation, **body}
+        if self.config.hf_repo:
+            payload["hf"] = {"repo": self.config.hf_repo, "push_every": self.config.hf_push_every,
+                             "resume_push_every": self.config.hf_resume_push_every}
+        data = json.dumps(payload, separators=(",", ":"), default=str).encode()
+        request = urllib.request.Request(self.config.url.rstrip("/") + "/v1/" + operation,
+            data=data, headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.config.token}, method="POST")
+        last = None
+        for attempt in range(self.config.retries + 1):
+            try:
+                with self._open(request, timeout=self.config.timeout) as response:
+                    result = json.loads(response.read().decode() or "{}")
+                    if not result.get("ok", True): raise RemoteTrainerError(result.get("error", "remote_error"), result.get("message", "remote error"), detail=result)
+                    return result.get("result", result)
+            except urllib.error.HTTPError as err:
+                detail = err.read().decode(errors="replace")[:1000]
+                raise RemoteTrainerError("http_error", f"remote HTTP {err.code}", status=err.code, detail=detail) from err
+            except (urllib.error.URLError, TimeoutError) as err:
+                last = err
+                if attempt == self.config.retries: break
+                time.sleep(min(.25 * (2 ** attempt), 1.0))
+        raise RemoteTrainerError("timeout" if isinstance(last, TimeoutError) else "connection", "remote trainer unavailable") from last
+
+    def health(self): return self._request("health", {})
+    def generate(self, role, prompt, config):
+        if role not in self.ROLES: raise ValueError("role must be challenger or solver")
+        return self._request("generate", {"role": role, "prompt": prompt, "generation_config": config})
+    def sample_challenger_action(self, prompt, legal_actions):
+        return self._request("sample_challenger_action", {"role": "challenger", "prompt": prompt, "legal_actions": legal_actions})
+    def _update(self, operation, value, episode_id=None, update_id=None):
+        episode_id = int(episode_id if episode_id is not None else value.get("episode_id", 0))
+        self._episode = max(self._episode, episode_id)
+        update_id = update_id or f"{self.config.run_id}:{episode_id}:{operation}"
+        return self._request(operation, {"episode_id": episode_id, "update_id": update_id, **value}, mutable=True)
+    def update_solver(self, examples):
+        episode_id = examples[0].get("episode_id", 0) if examples else 0
+        return self._update("update_solver", {"role": "solver", "correction_examples": examples}, episode_id)
+    def update_challenger(self, experience): return self._update("update_challenger", {"role": "challenger", "experience": experience})
+    def save_checkpoint(self, path): return self._request("save_checkpoint", {"checkpoint_id": str(path), "episode_id": self._episode})
+    def load_checkpoint(self, path): return self._request("load_checkpoint", {"checkpoint_id": str(path)})
+    def adapter_state(self, role): return self._request("adapter_state", {"role": role})
+    def shutdown(self): return self._request("shutdown", {})
+    def finalize(self): return self._request("finalize", {"episode_id": self._episode})
+
+
 class MockTrainer:
     def __init__(self, replies: list[str] | None = None): self.replies = replies or []; self.updates: list[tuple[str, Any]] = []
     def generate(self, role, prompt, config): return self.replies.pop(0) if self.replies else ""
@@ -321,6 +410,8 @@ class HFPEFTTrainer:
         elif self.model_config.quantization != "none":
             raise ValueError("quantization must be none or 4bit")
         self.model = d["AutoModelForCausalLM"].from_pretrained(self.model_config.model_id, **kwargs)
+        if self.model_config.quantization == "none" and getattr(getattr(torch, "cuda", None), "is_available", lambda: False)():
+            self.model.to("cuda")
         if self.model_config.quantization == "4bit": self.model = d["prepare_model_for_kbit_training"](self.model)
         lora = self.model_config.lora
         targets = lora.get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
@@ -437,6 +528,8 @@ class HFPEFTTrainer:
         return {"updated": True, "loss": value, "examples": len(examples), "step": self.steps["solver"], "adapter": self.active_adapter}
 
     def update_challenger(self, experience: dict[str, Any]):
+        if experience.get("log_probability") is None and experience.get("prompt") is not None and experience.get("action") is not None:
+            experience = dict(experience, log_probability=self.action_log_probability(experience["prompt"], experience["action"]))
         if experience.get("used_fallback") or not experience.get("valid", True) or experience.get("log_probability") is None:
             return {"updated": False, "reason": "fallback, illegal action, or missing log probability"}
         self.load(); self.set_adapter("challenger"); reward = experience.get("reward", 0.0)
@@ -452,6 +545,11 @@ class HFPEFTTrainer:
             self.model.save_pretrained(path / role, selected_adapters=[role])
             torch.save(self.optimizers[role].state_dict(), path / f"{role}-optimizer.pt")
         (path / "trainer.json").write_text(json.dumps({"steps": self.steps, "baseline": self.baseline, "model": asdict(self.model_config)}))
+        if hasattr(torch, "get_rng_state"):
+            rng = {"cpu": torch.get_rng_state()}
+            if getattr(getattr(torch, "cuda", None), "is_available", lambda: False)() and hasattr(torch.cuda, "get_rng_state_all"):
+                rng["cuda"] = torch.cuda.get_rng_state_all()
+            torch.save(rng, path / "rng.pt")
         return path
 
     def load_checkpoint(self, path: Path):
@@ -460,6 +558,11 @@ class HFPEFTTrainer:
             self.model.load_adapter(path / role, adapter_name=role, is_trainable=True)
             self.optimizers[role].load_state_dict(torch.load(path / f"{role}-optimizer.pt", map_location="cpu", weights_only=True))
         saved = json.loads((path / "trainer.json").read_text()); self.steps = saved["steps"]; self.baseline = saved["baseline"]
+        rng_path = path / "rng.pt"
+        if rng_path.exists() and hasattr(torch, "set_rng_state"):
+            rng = torch.load(rng_path, map_location="cpu", weights_only=True); torch.set_rng_state(rng["cpu"])
+            if rng.get("cuda") is not None and getattr(getattr(torch, "cuda", None), "is_available", lambda: False)() and hasattr(torch.cuda, "set_rng_state_all"):
+                torch.cuda.set_rng_state_all(rng["cuda"])
         self.set_adapter("challenger"); return self.health()
 
     def adapter_state(self, role: str):

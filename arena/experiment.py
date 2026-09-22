@@ -29,12 +29,43 @@ from .evidence import viewer_events, write_episode
 from .experiment_context import apply_changes, parse_object, parse_solver_response, selected_context, source_diff
 from .sandbox import SandboxConfig
 from .marl import choose_action, init_q, q_update, rolling_average, skill_state, challenger_reward as frontier_reward
-from .training import PRODUCTION_MODEL
+from .training import PRODUCTION_MODEL, HFPEFTTrainer, MockTrainer, ModelConfig, RemoteTrainer, RemoteTrainerConfig
 
 TRAIN = {'compression': CompressionBenchmark, 'csv': CsvBenchmark, 'http': HttpBenchmark,
          'expression': ExpressionBenchmark, 'graph': GraphBenchmark}
 VALIDATION = {'cache': CacheBenchmark, 'log': LogBenchmark, 'search': SearchBenchmark}
 ROOT = Path(__file__).resolve().parent.parent
+
+
+class TrainerModel:
+    """Small compatibility shim: the existing arena prompt construction speaks Trainer."""
+    def __init__(self, trainer, revision: str | None = None, *, evaluation: bool = False):
+        self.trainer = trainer
+        self.revision = revision or getattr(getattr(trainer, "model_config", None), "revision", None) or "configured"
+        self.evaluation = evaluation
+        self.prompts = {}
+    def generate(self, messages, *, seed, max_new_tokens):
+        role = "challenger" if "Challenger" in messages[0]["content"] else "solver"
+        prompt = "\n\n".join(message["content"] for message in messages)
+        self.prompts[role] = prompt
+        value = self.trainer.generate(role, prompt, {"max_new_tokens": max_new_tokens, "seed": seed})
+        if isinstance(value, dict):
+            return {"text": str(value.get("text", value.get("output", ""))), "tokens": value.get("tokens", 0),
+                    "truncated": bool(value.get("truncated", False)), **value}
+        return {"text": str(value), "tokens": 0, "truncated": False}
+
+
+def configured_trainer(args):
+    backend = getattr(args, 'trainer_backend', 'legacy')
+    if backend == 'mock': return MockTrainer()
+    if backend == 'legacy': return None
+    if backend == 'hf': return HFPEFTTrainer(ModelConfig(revision=getattr(args, 'model_revision', None)), allow_download=False)
+    token = os.environ.get(getattr(args, 'remote_token_env', 'ARENA_REMOTE_TOKEN'), '')
+    return RemoteTrainer(RemoteTrainerConfig(url=args.trainer_url, token=token, run_id=args.run_id,
+                         revision=getattr(args, 'model_revision', None), timeout=args.remote_timeout,
+                         retries=args.remote_retries, hf_repo=getattr(args, 'hf_repo', None),
+                         hf_push_every=getattr(args, 'hf_push_every', 5),
+                         hf_resume_push_every=getattr(args, 'hf_resume_push_every', 10)))
 
 
 class ShutdownController:
@@ -520,6 +551,17 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
     result['accepted'] = accepted
     solver_reward = float(result['reward_inputs']['solver_reward'])
     challenger_reward = float(result['reward_inputs']['challenger_reward'])
+    trainer_updates = []
+    if isinstance(model, TrainerModel) and not model.evaluation:
+        # Judge-verification is the trust boundary for the compact correction.
+        challenger = model.trainer.update_challenger({"episode_id": number, "valid": True,
+            "prompt": model.prompts.get("challenger", ""), "action": challenge, "reward": challenger_reward})
+        trainer_updates.append({"role": "challenger", **(challenger if isinstance(challenger, dict) else {})})
+        if changed and result['accepted']:
+            correction = {"episode_id": number, "input": {"challenge": challenge, "feedback": result['feedback']},
+                          "target": {"strategy": summary, "code": candidate.get('solution.c', '')}, "verified": True}
+            solver_update = model.trainer.update_solver([correction])
+            trainer_updates.append({"role": "solver", **(solver_update if isinstance(solver_update, dict) else {})})
     solver_memory = push_memory(state['solver_memory'],
         f'{name}: {summary}; Judge {result["feedback"]}; {reason}; files {", ".join(changed)}')
     challenger_memory = push_memory(state['challenger_memory'],
@@ -566,6 +608,7 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
                                                       'memory_bytes': result['performance'].get('memory_bytes')}),
                         'acceptance_reason': reason, 'baseline': baseline, 'replay': replay},
               'rewards': {'solver': solver_reward, 'challenger': challenger_reward},
+              'trainer_updates': trainer_updates,
               'outcome': 'accepted' if accepted else 'rejected', 'git_after': None,
               'timestamps': {'started_at': result['started_at'], 'candidate_at': result['started_at'],
                              'finished_at': result['finished_at']}}
@@ -603,22 +646,28 @@ def run(args, model=None, shutdown: ShutdownController | None = None):
 
 
 def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
-    from .experiment_model import offline_model
-    os.environ['HF_HUB_OFFLINE'] = '1'
-    os.environ['TRANSFORMERS_OFFLINE'] = '1'
     names = args.benchmarks.split(',')
     if not names or any(x not in TRAIN and x not in VALIDATION for x in names) or len(set(names)) != len(names):
         raise ValueError('benchmarks must be distinct training or validation names; bosses are sealed')
     run_dir = args.root.resolve() / args.run_id
     if model is None:
-        revision = json.loads((run_dir / 'state.json').read_text())['model_revision'] if args.resume else None
-        model = offline_model(revision)
+        trainer = configured_trainer(args)
+        if trainer is None:
+            from .experiment_model import offline_model
+            os.environ['HF_HUB_OFFLINE'] = '1'; os.environ['TRANSFORMERS_OFFLINE'] = '1'
+            revision = json.loads((run_dir / 'state.json').read_text())['model_revision'] if args.resume else None
+            model = offline_model(revision)
+        else:
+            revision = json.loads((run_dir / 'state.json').read_text())['model_revision'] if args.resume else getattr(args, 'model_revision', None)
+            model = TrainerModel(trainer, revision, evaluation=getattr(args, 'evaluation', False))
     config = SandboxConfig(cpus=args.cpus, memory_mb=args.memory_mb, pids=args.pids,
                            tmpfs_mb=args.tmpfs_mb, timeout_seconds=args.timeout_seconds,
                            output_bytes=min(args.output_bytes, 1024 * 1024))
     state, workspace = prepare_run(run_dir, args.run_id, args.seed, model.revision, args.hours,
                                    names, vars(args) | {'root': str(args.root)}, args.resume)
     state = reconcile(run_dir, state, workspace)
+    if isinstance(model, TrainerModel) and args.resume:
+        model.trainer.load_checkpoint(getattr(args, 'remote_checkpoint', None) or "latest")
     shutdown = shutdown or ShutdownController()
     shutdown.install()
     soft, hard = int(args.soft_gb * 1024**3), int(args.hard_gb * 1024**3)
@@ -635,6 +684,8 @@ def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
                     break
             state = episode(model, state, workspace, run_dir, config,
                             args.challenger_tokens, args.solver_tokens)
+            if isinstance(model, TrainerModel) and not model.evaluation:
+                model.trainer.save_checkpoint("latest")
             git_progress(state, workspace)
             atomic_json(run_dir / 'state.json', state)
             if run_bytes(run_dir, state, workspace) >= hard:
@@ -645,6 +696,11 @@ def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
             state['status'] = 'stopped'
             atomic_json(run_dir / 'state.json', state)
         safe_report(run_dir, state)
+        if isinstance(model, TrainerModel) and not model.evaluation and hasattr(model.trainer, 'finalize'):
+            try:
+                model.trainer.finalize()
+            except Exception as err:
+                state['trainer_final_publish_error'] = type(err).__name__
         if shutdown.requested:
             git_progress(state, workspace, final=True)
             atomic_json(run_dir / 'state.json', state)
@@ -653,7 +709,7 @@ def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='Offline autonomous arena experiment')
+    parser = argparse.ArgumentParser(description='Docker/TinyCC arena experiment with a configured trainer')
     parser.add_argument('--run-id')
     parser.add_argument('--preflight', action='store_true', help='verify cached model and offline Docker sandbox, then exit')
     parser.add_argument('--root', type=Path, default=Path('trajectories/episodes'))
@@ -662,6 +718,17 @@ def main(argv=None):
     parser.add_argument('--episodes', type=int)
     parser.add_argument('--git-push-every', type=int, default=0,
                         help='Best-effort lightweight progress push every N committed episodes (0 disables).')
+    parser.add_argument('--trainer-backend', choices=('remote', 'hf', 'mock', 'legacy'), default='remote')
+    parser.add_argument('--trainer-url', help='HTTPS Modal trainer endpoint (required for remote backend).')
+    parser.add_argument('--remote-token-env', default='ARENA_REMOTE_TOKEN', help='environment variable containing the remote bearer token')
+    parser.add_argument('--remote-timeout', type=float, default=120.0)
+    parser.add_argument('--remote-retries', type=int, default=2)
+    parser.add_argument('--remote-checkpoint', help='named remote/HF checkpoint for recovery after a replaced Modal container')
+    parser.add_argument('--model-revision')
+    parser.add_argument('--hf-repo', help='private Hub repository used by the remote trainer')
+    parser.add_argument('--hf-push-every', type=int, default=5)
+    parser.add_argument('--hf-resume-push-every', type=int, default=10)
+    parser.add_argument('--evaluation', action='store_true', help='generation-only mode; no trainer updates or checkpoints')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--benchmarks', default=','.join(TRAIN))
     parser.add_argument('--selection-mode', choices=('adaptive', 'round_robin'), default='adaptive')
@@ -677,6 +744,9 @@ def main(argv=None):
     parser.add_argument('--output-bytes', type=int, default=1024 * 1024)
     args = parser.parse_args(argv)
     if args.preflight:
+        if args.trainer_backend != 'legacy':
+            trainer = configured_trainer(args)
+            print(json.dumps(trainer.health(), indent=2)); return
         from .experiment_model import offline_model
         from .sandbox import run_c
         session = offline_model()
@@ -694,6 +764,10 @@ def main(argv=None):
         parser.error('duration and episode count must be positive')
     if args.git_push_every < 0:
         parser.error('--git-push-every must be >= 0')
+    if args.hf_push_every < 0 or args.hf_resume_push_every < 0 or args.remote_timeout <= 0 or args.remote_retries < 0:
+        parser.error('invalid remote/HF interval configuration')
+    if args.trainer_backend == 'remote' and not args.trainer_url:
+        parser.error('--trainer-url is required for --trainer-backend remote')
     if not 0 < args.soft_gb < args.hard_gb or args.hard_gb > 20:
         parser.error('invalid soft/hard quota')
     run(args)

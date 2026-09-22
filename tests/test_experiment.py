@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from arena import experiment
+from arena.training import MockTrainer
 from arena.experiment_context import apply_changes, lexical_search, parse_solver_response, read_range
 from arena.sandbox import SandboxConfig
 
@@ -50,6 +51,37 @@ class FakeModel:
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_production_backend_routes_generation_updates_checkpoint_and_eval_through_trainer(self):
+        class RecordingTrainer(MockTrainer):
+            def __init__(self):
+                super().__init__(['{"challenge":{"seed":1014,"size":1},"rationale":"r"}',
+                                  '{"summary":"s","changes":[{"path":"solution.c","content":"int main(void){return 0;}"}]}'])
+                self.saved = []; self.loaded = []
+            def save_checkpoint(self, path): self.saved.append(str(path)); return path
+            def load_checkpoint(self, path): self.loaded.append(str(path)); return {"restored": True}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); repo = root / 'repo'; repo.mkdir()
+            subprocess.run(['git', 'init', '-q', str(repo)], check=True); (repo / 'README').write_text('x')
+            env = os.environ | {'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+                                'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com'}
+            subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True); subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'initial'], check=True, env=env)
+            spec = repo / 'docs/benchmarks/compression/SPEC.md'; spec.parent.mkdir(parents=True); spec.write_text('Return zero.')
+            args = SimpleNamespace(root=root / 'runs', run_id='trainer_run', seed=5, hours=None, episodes=1, resume=False,
+                benchmarks='compression', cpus=1, selection_mode='round_robin', memory_mb=256, pids=64, tmpfs_mb=128,
+                timeout_seconds=3, output_bytes=65536, soft_gb=.1, hard_gb=.2, challenger_tokens=100, solver_tokens=200,
+                trainer_backend='remote', evaluation=False)
+            trainer = RecordingTrainer()
+            with patch.object(experiment, 'ROOT', repo), patch.dict(experiment.TRAIN, {'compression': FakeBenchmark}), \
+                 patch.object(experiment, 'configured_trainer', return_value=trainer), patch.dict(os.environ, env):
+                experiment.run(args)
+            self.assertEqual([kind for kind, _ in trainer.updates], ['challenger', 'solver'])
+            self.assertTrue(trainer.saved); self.assertEqual(trainer.replies, [])
+            # Evaluation uses the same generation path but never calls update/checkpoint.
+            trainer = RecordingTrainer(); args.run_id, args.evaluation = 'trainer_eval', True
+            with patch.object(experiment, 'ROOT', repo), patch.dict(experiment.TRAIN, {'compression': FakeBenchmark}), \
+                 patch.object(experiment, 'configured_trainer', return_value=trainer), patch.dict(os.environ, env):
+                experiment.run(args)
+            self.assertEqual(trainer.updates, []); self.assertEqual(trainer.saved, [])
     def test_run_limits_and_graceful_shutdown_controller(self):
         args = SimpleNamespace(hours=None, episodes=None)
         state = {'episode': 4, 'deadline': None}
