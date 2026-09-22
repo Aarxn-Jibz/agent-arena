@@ -11,6 +11,27 @@ from arena.training import (Checkpoints, Curriculum, EpisodeOrchestrator, HFPEFT
 
 
 class TrainingArchitectureTests(unittest.TestCase):
+    def test_chat_template_list_is_tensorized_before_context_check(self):
+        class Tensor:
+            def __init__(self, values): self.values = values
+            @property
+            def shape(self): return (1, len(self.values)) if getattr(self, 'batched', False) else (len(self.values),)
+            def unsqueeze(self, dim): self.batched = True; return self
+            def to(self, device): self.device = device; return self
+        class Tokenizer:
+            def apply_chat_template(self, messages, **kwargs): return [1, 2, 3]
+        class Parameter: device = 'cpu'
+        class Model:
+            def parameters(self): return iter([Parameter()])
+        class Torch:
+            @staticmethod
+            def tensor(value): return Tensor(value)
+        trainer = HFPEFTTrainer(ModelConfig(), dependencies={'torch': Torch()})
+        trainer.model, trainer.tokenizer = Model(), Tokenizer()
+        inputs = trainer._generation_inputs('prompt')
+        self.assertEqual(inputs['input_ids'].shape[1], 3)
+        self.assertEqual(inputs['input_ids'].device, 'cpu')
+
     def test_generation_uses_chat_continuation_slice_and_code_stop(self):
         class Ids:
             def __init__(self, values, batched=False): self.values, self.batched = values, batched

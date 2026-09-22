@@ -473,14 +473,22 @@ class HFPEFTTrainer:
         return {key: value.to(device) for key, value in encoded.items()}
 
     def _generation_inputs(self, prompt: str):
+        torch = self._dependencies()["torch"]
         if hasattr(self.tokenizer, "apply_chat_template"):
-            ids = self.tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=True,
-                                                    add_generation_prompt=True, return_tensors="pt")
-            encoded = {"input_ids": ids}
+            kwargs = {"tokenize": True, "add_generation_prompt": True, "return_tensors": "pt"}
+            try: rendered = self.tokenizer.apply_chat_template([{"role": "user", "content": prompt}], return_dict=True, **kwargs)
+            except TypeError: rendered = self.tokenizer.apply_chat_template([{"role": "user", "content": prompt}], **kwargs)
+            encoded = dict(rendered) if isinstance(rendered, dict) else {"input_ids": rendered}
         else:
             encoded = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         device = next(self.model.parameters()).device
-        return {key: value.to(device) for key, value in encoded.items()}
+        result = {}
+        for key, value in encoded.items():
+            if not hasattr(value, "to"):
+                value = torch.tensor(value)
+                if len(value.shape) == 1: value = value.unsqueeze(0)
+            result[key] = value.to(device)
+        return result
 
     def count(self, text: str) -> int:
         """Tokenizer-derived count for ``compose_context(..., trainer)``."""
