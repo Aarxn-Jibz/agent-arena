@@ -51,6 +51,23 @@ class FakeModel:
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_prepare_run_serializes_eval_manifest_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp) / 'repo'; repo.mkdir(); subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            (repo / 'README').write_text('x')
+            env = os.environ | {'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+                                'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com'}
+            subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+            subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'initial'], check=True, env=env)
+            config = {'selection_mode': 'round_robin', 'eval_manifest': Path(temp) / 'sealed.json',
+                      'nested': {'paths': [Path(temp) / 'a', (Path(temp) / 'b',)]}}
+            with patch.object(experiment, 'ROOT', repo), patch.dict(os.environ, env):
+                state, _ = experiment.prepare_run(Path(temp) / 'run', 'path_config', 1, 'rev', None,
+                                                  ['compression'], config, False)
+            self.assertEqual(state['config']['eval_manifest'], str(config['eval_manifest']))
+            self.assertEqual(state['config']['nested']['paths'][1], [str(Path(temp) / 'b')])
+            self.assertEqual(json.loads((Path(temp) / 'run' / 'state.json').read_text())['config'], state['config'])
+
     def test_curriculum_actions_are_bounded_and_invalid_sample_is_not_credited(self):
         curriculum = experiment.Curriculum(['cache'])
         class Trainer:

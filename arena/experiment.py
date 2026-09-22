@@ -157,6 +157,13 @@ def atomic_json(path: Path, value):
     os.replace(temp, path)
 
 
+def json_safe(value):
+    if isinstance(value, Path): return str(value)
+    if isinstance(value, dict): return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)): return [json_safe(item) for item in value]
+    return value
+
+
 def git(*args, cwd=None):
     p = subprocess.run(['git', *args], cwd=cwd or ROOT, text=True, capture_output=True, check=True)
     return p.stdout.strip()
@@ -419,6 +426,7 @@ def judge_candidate(benchmark, files: dict[str, str], challenge: dict, config: S
 
 def prepare_run(run_dir: Path, run_id: str, seed: int, model_revision: str, hours: float | None,
                 benchmarks: list[str], config: dict, resume: bool):
+    config = json_safe(config)
     state_path = run_dir / 'state.json'
     workspace = run_dir / 'workspace'
     if resume:
