@@ -41,7 +41,7 @@ def production_model_config() -> ModelConfig:
 def _version(name: str) -> str | None:
     try:
         return __import__(name).__version__
-    except (ImportError, AttributeError):
+    except (ImportError, AttributeError, OSError):
         return None
 
 
@@ -65,7 +65,7 @@ def hardware_profile() -> dict[str, Any]:
             p = torch.cuda.get_device_properties(0)
             profile.update(gpu_name=p.name, vram_gb=round(p.total_memory / 2**30, 2),
                            bf16=bool(torch.cuda.is_bf16_supported()), fp16=True)
-    except ImportError:
+    except (ImportError, OSError):
         pass
     try:
         import os as _os
@@ -297,7 +297,7 @@ class HFPEFTTrainer:
                     "AutoTokenizer": AutoTokenizer, "BitsAndBytesConfig": BitsAndBytesConfig,
                     "LoraConfig": LoraConfig, "TaskType": TaskType, "get_peft_model": get_peft_model,
                     "prepare_model_for_kbit_training": prepare_model_for_kbit_training}
-        except ImportError as err:
+        except (ImportError, OSError) as err:
             raise RuntimeError("HF/PEFT runtime requires torch, transformers and peft (and bitsandbytes for 4-bit QLoRA)") from err
 
     def _dtype(self, torch):
