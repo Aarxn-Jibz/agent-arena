@@ -50,6 +50,62 @@ class FakeModel:
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_run_limits_and_graceful_shutdown_controller(self):
+        args = SimpleNamespace(hours=None, episodes=None)
+        state = {'episode': 4, 'deadline': None}
+        controller = experiment.ShutdownController()
+        self.assertTrue(experiment.should_continue(state, args, controller))
+        args.hours, state['deadline'] = 1, 0
+        self.assertFalse(experiment.should_continue(state, args, controller))
+        args.hours, args.episodes, state['deadline'], state['episode'] = None, 3, None, 3
+        self.assertFalse(experiment.should_continue(state, args, controller))
+        args.episodes, state['episode'] = 5, 3
+        self.assertTrue(experiment.should_continue(state, args, controller))
+        controller.handler(None, None)
+        self.assertTrue(controller.requested)
+        self.assertFalse(experiment.should_continue(state, args, controller))
+        with self.assertRaises(KeyboardInterrupt): controller.handler(None, None)
+        self.assertTrue(controller.forced)
+
+    def test_git_progress_threshold_failure_and_idempotency(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); state = {'run_id': 'night', 'episode': 5, 'git_push_every': 5,
+                                     'last_git_progress_episode': 0, 'last_git_commit_episode': 0,
+                                     'status': 'running'}
+            def result(stdout=''):
+                return SimpleNamespace(stdout=stdout)
+            with patch.object(experiment, 'ROOT', root), patch.object(experiment.subprocess, 'run',
+                 side_effect=[result(' M experiment-progress/night.json'), result(), result(), result()] ) as call:
+                self.assertTrue(experiment.git_progress(state))
+            self.assertEqual(state['last_git_progress_episode'], 5)
+            self.assertEqual(state['last_git_commit_episode'], 5)
+            # Already pushed and no changed file: no duplicate commit/push.
+            with patch.object(experiment, 'ROOT', root), patch.object(experiment.subprocess, 'run', return_value=result('')) as call:
+                self.assertFalse(experiment.git_progress(state, final=True))
+                self.assertEqual(call.call_count, 1)
+            state.update(episode=6, last_git_progress_episode=0)
+            with patch.object(experiment, 'ROOT', root), patch.object(experiment.subprocess, 'run',
+                 side_effect=[result(''), subprocess.CalledProcessError(1, ['git', 'push'])]):
+                self.assertFalse(experiment.git_progress(state))
+            self.assertIn('git', state['git_last_error'])
+            # No push before a scheduled interval.
+            state.update(episode=1, last_git_progress_episode=0)
+            with patch.object(experiment.subprocess, 'run') as call:
+                self.assertFalse(experiment.git_progress(state)); call.assert_not_called()
+
+    def test_final_progress_push_is_only_after_safe_episode_boundary(self):
+        controller = experiment.ShutdownController()
+        events = []
+        # The production loop checks the request between episodes; this models
+        # an in-flight judge asking to stop and then completing its boundary.
+        controller.handler(None, None)
+        self.assertTrue(controller.requested)
+        events.append('judge/update complete')
+        events.append('atomic checkpoint')
+        self.assertFalse(experiment.should_continue({'episode': 1, 'deadline': None}, SimpleNamespace(episodes=None), controller))
+        events.append('final git push')
+        self.assertEqual(events, ['judge/update complete', 'atomic checkpoint', 'final git push'])
+
     def test_model_delta_validation_and_invalid_solver_evidence(self):
         class Toy:
             def initialize(self, seed):

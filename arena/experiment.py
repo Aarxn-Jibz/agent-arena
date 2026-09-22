@@ -8,6 +8,7 @@ import json
 import os
 import random
 import re
+import signal
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -29,6 +30,68 @@ TRAIN = {'compression': CompressionBenchmark, 'csv': CsvBenchmark, 'http': HttpB
          'expression': ExpressionBenchmark, 'graph': GraphBenchmark}
 VALIDATION = {'cache': CacheBenchmark, 'log': LogBenchmark, 'search': SearchBenchmark}
 ROOT = Path(__file__).resolve().parent.parent
+
+
+class ShutdownController:
+    """First signal stops at an episode boundary; a second one aborts now."""
+    def __init__(self): self.requested = self.forced = False; self._old = {}
+    def handler(self, signum, frame):
+        if self.requested:
+            self.forced = True
+            raise KeyboardInterrupt
+        self.requested = True
+        print('Shutdown requested; finishing current episode and checkpointing...', flush=True)
+    def install(self):
+        for item in (signal.SIGINT, getattr(signal, 'SIGTERM', None)):
+            if item is not None: self._old[item] = signal.signal(item, self.handler)
+    def restore(self):
+        for item, previous in self._old.items(): signal.signal(item, previous)
+
+
+def should_continue(state: dict, args, shutdown: ShutdownController | None = None) -> bool:
+    if shutdown and shutdown.requested: return False
+    if args.episodes is not None and state['episode'] >= args.episodes: return False
+    return state.get('deadline') is None or time.time() < state['deadline']
+
+
+def progress_path(run_id: str) -> Path:
+    return ROOT / 'experiment-progress' / f'{run_id}.json'
+
+
+def write_progress(state: dict):
+    """Only compact state goes into Git; evidence/checkpoints remain local."""
+    value = {key: state.get(key) for key in ('run_id', 'episode', 'started_at', 'benchmarks', 'model_id',
+             'model_revision', 'selection_counts', 'performance_history', 'git_push_every',
+             'last_git_progress_episode', 'last_git_commit_episode', 'status')}
+    path = progress_path(state['run_id']); atomic_json(path, value); return path
+
+
+def git_progress(state: dict, *, final: bool = False) -> bool:
+    """Best-effort progress visibility. Never raises into the training loop."""
+    every = int(state.get('git_push_every', 0))
+    if not every: return False
+    episode, pushed = state['episode'], int(state.get('last_git_progress_episode', 0))
+    if not final and episode - pushed < every: return False
+    path = write_progress(state)
+    try:
+        dirty = subprocess.run(['git', 'status', '--porcelain', '--', str(path.relative_to(ROOT))], cwd=ROOT,
+                               text=True, capture_output=True, check=True).stdout.strip()
+        committed = int(state.get('last_git_commit_episode', 0))
+        if dirty:
+            subprocess.run(['git', 'add', '--', str(path.relative_to(ROOT))], cwd=ROOT, check=True)
+            start = committed + 1
+            subprocess.run(['git', 'commit', '-m', f'experiment({state["run_id"]}): episodes {start}-{episode}'],
+                           cwd=ROOT, check=True)
+            state['last_git_commit_episode'] = episode
+        if state.get('last_git_progress_episode', 0) < episode:
+            subprocess.run(['git', 'push'], cwd=ROOT, check=True, capture_output=True, text=True)
+            state['last_git_progress_episode'] = episode
+        state['git_last_error'] = None
+        return bool(dirty)
+    except (OSError, subprocess.CalledProcessError) as err:
+        state['git_last_error'] = str(err)
+        print(f'Git progress push failed (continuing): {err}', flush=True)
+        return False
 
 
 def now():
@@ -223,13 +286,18 @@ def prepare_run(run_dir: Path, run_id: str, seed: int, model_revision: str, hour
         state.setdefault('alpha', .4)
         state.setdefault('gamma', .8)
         state.setdefault('epsilon', .3)
+        state.setdefault('git_push_every', 0)
+        state.setdefault('last_git_progress_episode', 0)
+        state.setdefault('last_git_commit_episode', 0)
+        state.setdefault('status', 'running')
+        state['config'].setdefault('git_push_every', 0)
         state['config'].setdefault('selection_mode', 'round_robin')
         if (state['run_id'] != run_id or state['seed'] != seed or state['benchmarks'] != benchmarks
                 or state['model_revision'] != model_revision):
             raise ValueError('resume configuration differs from checkpoint')
         for key in ('selection_mode', 'challenger_tokens', 'solver_tokens', 'cpus', 'memory_mb', 'pids',
-                    'tmpfs_mb', 'timeout_seconds', 'output_bytes', 'soft_gb', 'hard_gb'):
-            if state['config'][key] != config[key]:
+                    'tmpfs_mb', 'timeout_seconds', 'output_bytes', 'soft_gb', 'hard_gb', 'git_push_every'):
+            if state['config'][key] != config.get(key, 0):
                 raise ValueError(f'resume {key} differs from checkpoint')
         return state, workspace
     if run_dir.exists() and any(run_dir.iterdir()):
@@ -250,6 +318,8 @@ def prepare_run(run_dir: Path, run_id: str, seed: int, model_revision: str, hour
              'selection_mode': config['selection_mode'], 'Q_challenger': init_q(benchmarks),
              'performance_history': [], 'policy_rng_state': policy_rng.getstate(),
              'alpha': .4, 'gamma': .8, 'epsilon': .3}
+    state.update(git_push_every=config.get('git_push_every', 0), last_git_progress_episode=0,
+                 last_git_commit_episode=0, status='running')
     atomic_json(state_path, state)
     atomic_json(run_dir / 'manifest.json', state)
     return state, workspace
@@ -505,17 +575,17 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
     return next_state
 
 
-def run(args, model=None):
+def run(args, model=None, shutdown: ShutdownController | None = None):
     args.root.mkdir(parents=True, exist_ok=True)
     with (args.root / (args.run_id + '.lock')).open('w') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as err:
             raise RuntimeError('experiment run is already active') from err
-        return _run_locked(args, model)
+        return _run_locked(args, model, shutdown)
 
 
-def _run_locked(args, model=None):
+def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
     from .experiment_model import offline_model
     os.environ['HF_HUB_OFFLINE'] = '1'
     os.environ['TRANSFORMERS_OFFLINE'] = '1'
@@ -532,9 +602,11 @@ def _run_locked(args, model=None):
     state, workspace = prepare_run(run_dir, args.run_id, args.seed, model.revision, args.hours,
                                    names, vars(args) | {'root': str(args.root)}, args.resume)
     state = reconcile(run_dir, state, workspace)
+    shutdown = shutdown or ShutdownController()
+    shutdown.install()
     soft, hard = int(args.soft_gb * 1024**3), int(args.hard_gb * 1024**3)
     try:
-        while (args.episodes is None or state['episode'] < args.episodes) and (state['deadline'] is None or time.time() < state['deadline']):
+        while should_continue(state, args, shutdown):
             size = run_bytes(run_dir, state, workspace)
             if size >= hard - 64 * 1024 * 1024:
                 print('Hard artifact quota reached; checkpointed.', flush=True)
@@ -546,11 +618,20 @@ def _run_locked(args, model=None):
                     break
             state = episode(model, state, workspace, run_dir, config,
                             args.challenger_tokens, args.solver_tokens)
+            git_progress(state)
+            atomic_json(run_dir / 'state.json', state)
             if run_bytes(run_dir, state, workspace) >= hard:
                 print('Hard artifact quota reached after episode; checkpointed.', flush=True)
                 break
     finally:
+        if shutdown.requested:
+            state['status'] = 'stopped'
+            atomic_json(run_dir / 'state.json', state)
         safe_report(run_dir, state)
+        if shutdown.requested:
+            git_progress(state, final=True)
+            atomic_json(run_dir / 'state.json', state)
+        shutdown.restore()
     return state
 
 
@@ -562,6 +643,8 @@ def main(argv=None):
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--hours', type=float)
     parser.add_argument('--episodes', type=int)
+    parser.add_argument('--git-push-every', type=int, default=0,
+                        help='Best-effort lightweight progress push every N committed episodes (0 disables).')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--benchmarks', default=','.join(TRAIN))
     parser.add_argument('--selection-mode', choices=('adaptive', 'round_robin'), default='adaptive')
@@ -590,10 +673,10 @@ def main(argv=None):
         parser.error('--run-id is required for a run')
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', args.run_id):
         parser.error('--run-id must contain 1–80 letters, digits, underscores, or hyphens')
-    if not args.hours and not args.episodes:
-        parser.error('specify --hours or --episodes')
     if args.hours is not None and args.hours <= 0 or args.episodes is not None and args.episodes <= 0:
         parser.error('duration and episode count must be positive')
+    if args.git_push_every < 0:
+        parser.error('--git-push-every must be >= 0')
     if not 0 < args.soft_gb < args.hard_gb or args.hard_gb > 20:
         parser.error('invalid soft/hard quota')
     run(args)
