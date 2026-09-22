@@ -56,7 +56,8 @@ class TrainerModel:
         value = self.trainer.generate(role, prompt, {"max_new_tokens": max_new_tokens, "seed": seed})
         if isinstance(value, dict):
             return {"text": str(value.get("text", value.get("output", ""))), "tokens": value.get("tokens", 0),
-                    "truncated": bool(value.get("truncated", False)), **value}
+                    "truncated": bool(value.get("truncated", False)), "input_prompt": prompt,
+                    "raw_generation": value.get("raw_generation", value.get("text", value.get("output", ""))), **value}
         return {"text": str(value), "tokens": 0, "truncated": False}
 
 

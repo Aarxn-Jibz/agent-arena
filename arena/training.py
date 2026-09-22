@@ -174,7 +174,11 @@ def parse_solver_contract(text: str) -> SolverResponse:
         m = re.search(rf"<{name}>\s*(.*?)\s*</{name}>", text, re.S | re.I)
         return m.group(1).strip() if m else None
     strategy, refs, code = section("STRATEGY"), section("REFERENCE_USAGE"), section("CODE")
-    if not code: return SolverResponse(strategy or "", [], {}, "", "missing CODE section")
+    if not code:
+        blocks = re.findall(r"```c\s*\n(.*?)\n```", text, re.S | re.I)
+        if len(blocks) == 1 and re.search(r"\b(?:int\s+main|#include)\b", blocks[0]):
+            return SolverResponse(strategy or "", [], {}, blocks[0].strip() + "\n")
+        return SolverResponse(strategy or "", [], {}, "", "missing CODE section")
     code = re.sub(r"^\s*```(?:c|C)?\s*\n?", "", code)
     code = re.sub(r"\n?\s*```\s*$", "", code).strip()
     if not code: return SolverResponse(strategy or "", [], {}, "", "missing CODE section")
@@ -468,6 +472,16 @@ class HFPEFTTrainer:
         device = next(self.model.parameters()).device
         return {key: value.to(device) for key, value in encoded.items()}
 
+    def _generation_inputs(self, prompt: str):
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            ids = self.tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=True,
+                                                    add_generation_prompt=True, return_tensors="pt")
+            encoded = {"input_ids": ids}
+        else:
+            encoded = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        device = next(self.model.parameters()).device
+        return {key: value.to(device) for key, value in encoded.items()}
+
     def count(self, text: str) -> int:
         """Tokenizer-derived count for ``compose_context(..., trainer)``."""
         self.load()
@@ -480,19 +494,27 @@ class HFPEFTTrainer:
     def generate(self, role: str, prompt: str, config: dict[str, Any]):
         self.load()
         if role != "base": self.set_adapter(role)
-        d = self._dependencies(); torch = d["torch"]; inputs = self._encode(prompt)
+        d = self._dependencies(); torch = d["torch"]; inputs = self._generation_inputs(prompt)
         maximum = int(config.get("max_new_tokens", self.model_config.generation["max_new_tokens"]))
         if inputs["input_ids"].shape[1] + maximum > self.model_config.context_length: raise ValueError("prompt exceeds configured context budget")
+        input_len = inputs["input_ids"].shape[-1]
+        tokenizer, start = self.tokenizer, input_len
+        class StopAtCode:
+            def __call__(self, input_ids, scores, **kwargs):
+                return "</CODE>" in tokenizer.decode(input_ids[0, start:], skip_special_tokens=True)
         with torch.inference_mode():
             generate = lambda: self.model.generate(**inputs, max_new_tokens=maximum, do_sample=config.get("do_sample", True),
                 temperature=float(config.get("temperature", self.model_config.generation.get("temperature", .7))),
                 top_p=float(config.get("top_p", self.model_config.generation.get("top_p", .9))),
-                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
+                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                stopping_criteria=[StopAtCode()])
             if role == "base":
                 with self.model.disable_adapter(): output = generate()
             else: output = generate()
-        generated = output[0, inputs["input_ids"].shape[1]:]
-        return {"text": self.tokenizer.decode(generated, skip_special_tokens=True), "tokens": int(generated.shape[0])}
+        generated = output[0, input_len:]
+        text = self.tokenizer.decode(generated, skip_special_tokens=True)
+        if "</CODE>" in text: text = text[:text.index("</CODE>") + len("</CODE>")]
+        return {"text": text, "raw_generation": text, "tokens": int(generated.shape[0]), "prompt_tokens": int(input_len)}
 
     def action_log_probability(self, prompt: str, action: dict[str, Any]):
         """Differentiable log P(action JSON | prompt), retained for REINFORCE."""

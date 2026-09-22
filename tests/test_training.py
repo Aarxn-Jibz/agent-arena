@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 
 from arena.training import (Checkpoints, Curriculum, EpisodeOrchestrator, HFPEFTTrainer, MockTrainer, ModelConfig,
@@ -10,6 +11,42 @@ from arena.training import (Checkpoints, Curriculum, EpisodeOrchestrator, HFPEFT
 
 
 class TrainingArchitectureTests(unittest.TestCase):
+    def test_generation_uses_chat_continuation_slice_and_code_stop(self):
+        class Ids:
+            def __init__(self, values, batched=False): self.values, self.batched = values, batched
+            @property
+            def shape(self): return (1, len(self.values)) if self.batched else (len(self.values),)
+            def to(self, device): return self
+            def __getitem__(self, key):
+                if isinstance(key, tuple): return Ids(self.values[key[1]])
+                return self.values[key]
+        class Tokenizer:
+            pad_token_id = eos_token_id = 0
+            def apply_chat_template(self, messages, **kwargs): self.messages = messages; return Ids([10, 11], True)
+            def decode(self, ids, **kwargs):
+                values = ids.values if isinstance(ids, Ids) else ids
+                return '<CODE>#include <stdio.h>\nint main(void){return 0;}</CODE> trailing' if values == [20, 21, 22] else '<CODE>one complete C program</CODE>'
+        class Parameter: device = 'cpu'
+        class Model:
+            def parameters(self): return iter([Parameter()])
+            def named_parameters(self): return []
+            def set_adapter(self, role): pass
+            def generate(self, **kwargs):
+                self.kwargs = kwargs
+                self.stopped = kwargs['stopping_criteria'][0](Ids([10, 11, 20, 21, 22], True), None)
+                return Ids([10, 11, 20, 21, 22], True)
+        class Torch:
+            @staticmethod
+            def inference_mode(): return nullcontext()
+        trainer = HFPEFTTrainer(ModelConfig(context_length=3000), dependencies={'torch': Torch()})
+        trainer.model, trainer.tokenizer = Model(), Tokenizer()
+        result = trainer.generate('solver', '<CODE>one complete C program</CODE>', {'max_new_tokens': 2500})
+        self.assertEqual(trainer.tokenizer.messages, [{'role': 'user', 'content': '<CODE>one complete C program</CODE>'}])
+        self.assertEqual(trainer.model.kwargs['max_new_tokens'], 2500)
+        self.assertTrue(trainer.model.stopped); self.assertEqual(result['tokens'], 3)
+        self.assertEqual(result['text'], '<CODE>#include <stdio.h>\nint main(void){return 0;}</CODE>')
+        self.assertNotIn('one complete C program', result['text'])
+
     def test_hf_backend_adapter_isolation_checkpoint_and_offline_load(self):
         class Param:
             def __init__(self, n): self.n, self.requires_grad, self.device = n, True, "cpu"
@@ -86,17 +123,19 @@ class TrainingArchitectureTests(unittest.TestCase):
         good = parse_solver_contract("<STRATEGY>x</STRATEGY>\n<REFERENCE_USAGE>R2 - scanf details</REFERENCE_USAGE>\n<CODE>int main(){} </CODE>")
         self.assertEqual(good.reference_ids, ["R2"]); self.assertIn("int main", good.code)
         self.assertEqual(parse_solver_contract("<STRATEGY>x</STRATEGY><REFERENCE_USAGE>NONE</REFERENCE_USAGE><CODE>x</CODE>").reference_ids, [])
-        self.assertIsNotNone(parse_solver_contract("```c\nint main(){}\n```").malformed)
+        self.assertIn("int main", parse_solver_contract("```c\nint main(){}\n```").code)
         self.assertEqual(reference_identity("one\n\ntwo", "v1")["section_ids"], ["R1", "R2"])
 
     def test_solver_contract_tolerates_tags_fences_and_prose(self):
         fenced = parse_solver_contract("<STRATEGY>short</STRATEGY><REFERENCE_USAGE>R1/R2</REFERENCE_USAGE><CODE>```c\nint main(void){return 0;}\n```</CODE>")
         prose = parse_solver_contract("note\n<CODE>int main(void){return 0;}</CODE>\ndone")
         legacy = parse_solver_contract('{"summary":"x","changes":[]}')
+        fallback = parse_solver_contract('```c\n#include <stdio.h>\nint main(void){return 0;}\n```')
         self.assertEqual(fenced.reference_ids, ["R1", "R2"])
         self.assertEqual(fenced.code, "int main(void){return 0;}\n")
         self.assertEqual(prose.strategy, ""); self.assertIn("int main", prose.code)
         self.assertEqual(legacy.malformed, "missing CODE section")
+        self.assertIn('int main', fallback.code)
 
     def test_resource_feedback_and_large_logs(self):
         self.assertEqual(normalize_resource_status(None)["status"], "unknown")
