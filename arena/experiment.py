@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -13,6 +12,12 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+    import msvcrt
 
 from .compression import CompressionBenchmark
 from .csv_benchmark import CsvBenchmark
@@ -587,8 +592,12 @@ def run(args, model=None, shutdown: ShutdownController | None = None):
     args.root.mkdir(parents=True, exist_ok=True)
     with (args.root / (args.run_id + '.lock')).open('w') as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as err:
+            if fcntl:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                lock.write('0'); lock.flush(); lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except (BlockingIOError, OSError) as err:
             raise RuntimeError('experiment run is already active') from err
         return _run_locked(args, model, shutdown)
 
