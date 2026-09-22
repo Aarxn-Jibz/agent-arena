@@ -79,6 +79,8 @@ class ExperimentTests(unittest.TestCase):
                 self.assertTrue(experiment.git_progress(state))
             self.assertEqual(state['last_git_progress_episode'], 5)
             self.assertEqual(state['last_git_commit_episode'], 5)
+            self.assertTrue(state['git_upstream_set'])
+            self.assertIn('experiment/night', call.call_args_list[-1].args[0])
             # Already pushed and no changed file: no duplicate commit/push.
             with patch.object(experiment, 'ROOT', root), patch.object(experiment.subprocess, 'run', return_value=result('')) as call:
                 self.assertFalse(experiment.git_progress(state, final=True))

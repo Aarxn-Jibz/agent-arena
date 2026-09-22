@@ -54,38 +54,45 @@ def should_continue(state: dict, args, shutdown: ShutdownController | None = Non
     return state.get('deadline') is None or time.time() < state['deadline']
 
 
-def progress_path(run_id: str) -> Path:
-    return ROOT / 'experiment-progress' / f'{run_id}.json'
+def progress_path(run_id: str, workspace: Path | None = None) -> Path:
+    workspace = ROOT if workspace is None else workspace
+    return workspace / 'experiment-progress' / f'{run_id}.json'
 
 
-def write_progress(state: dict):
+def write_progress(state: dict, workspace: Path | None = None):
     """Only compact state goes into Git; evidence/checkpoints remain local."""
     value = {key: state.get(key) for key in ('run_id', 'episode', 'started_at', 'benchmarks', 'model_id',
              'model_revision', 'selection_counts', 'performance_history', 'git_push_every',
              'last_git_progress_episode', 'last_git_commit_episode', 'status')}
-    path = progress_path(state['run_id']); atomic_json(path, value); return path
+    workspace = ROOT if workspace is None else workspace
+    path = progress_path(state['run_id'], workspace); atomic_json(path, value); return path
 
 
-def git_progress(state: dict, *, final: bool = False) -> bool:
+def git_progress(state: dict, workspace: Path | None = None, *, final: bool = False) -> bool:
     """Best-effort progress visibility. Never raises into the training loop."""
+    workspace = ROOT if workspace is None else workspace
     every = int(state.get('git_push_every', 0))
     if not every: return False
     episode, pushed = state['episode'], int(state.get('last_git_progress_episode', 0))
     if not final and episode - pushed < every: return False
-    path = write_progress(state)
+    path = write_progress(state, workspace)
     try:
-        dirty = subprocess.run(['git', 'status', '--porcelain', '--', str(path.relative_to(ROOT))], cwd=ROOT,
+        relative = str(path.relative_to(workspace))
+        dirty = subprocess.run(['git', 'status', '--porcelain', '--', relative], cwd=workspace,
                                text=True, capture_output=True, check=True).stdout.strip()
         committed = int(state.get('last_git_commit_episode', 0))
         if dirty:
-            subprocess.run(['git', 'add', '--', str(path.relative_to(ROOT))], cwd=ROOT, check=True)
+            subprocess.run(['git', 'add', '--', relative], cwd=workspace, check=True)
             start = committed + 1
             subprocess.run(['git', 'commit', '-m', f'experiment({state["run_id"]}): episodes {start}-{episode}'],
-                           cwd=ROOT, check=True)
+                           cwd=workspace, check=True)
             state['last_git_commit_episode'] = episode
         if state.get('last_git_progress_episode', 0) < episode:
-            subprocess.run(['git', 'push'], cwd=ROOT, check=True, capture_output=True, text=True)
+            command = (['git', 'push'] if state.get('git_upstream_set')
+                       else ['git', 'push', '--set-upstream', 'origin', state.get('branch', 'experiment/' + state['run_id'])])
+            subprocess.run(command, cwd=workspace, check=True, capture_output=True, text=True)
             state['last_git_progress_episode'] = episode
+            state['git_upstream_set'] = True
         state['git_last_error'] = None
         return bool(dirty)
     except (OSError, subprocess.CalledProcessError) as err:
@@ -289,6 +296,7 @@ def prepare_run(run_dir: Path, run_id: str, seed: int, model_revision: str, hour
         state.setdefault('git_push_every', 0)
         state.setdefault('last_git_progress_episode', 0)
         state.setdefault('last_git_commit_episode', 0)
+        state.setdefault('git_upstream_set', False)
         state.setdefault('status', 'running')
         state['config'].setdefault('git_push_every', 0)
         state['config'].setdefault('selection_mode', 'round_robin')
@@ -319,7 +327,7 @@ def prepare_run(run_dir: Path, run_id: str, seed: int, model_revision: str, hour
              'performance_history': [], 'policy_rng_state': policy_rng.getstate(),
              'alpha': .4, 'gamma': .8, 'epsilon': .3}
     state.update(git_push_every=config.get('git_push_every', 0), last_git_progress_episode=0,
-                 last_git_commit_episode=0, status='running')
+                 last_git_commit_episode=0, git_upstream_set=False, status='running')
     atomic_json(state_path, state)
     atomic_json(run_dir / 'manifest.json', state)
     return state, workspace
@@ -618,7 +626,7 @@ def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
                     break
             state = episode(model, state, workspace, run_dir, config,
                             args.challenger_tokens, args.solver_tokens)
-            git_progress(state)
+            git_progress(state, workspace)
             atomic_json(run_dir / 'state.json', state)
             if run_bytes(run_dir, state, workspace) >= hard:
                 print('Hard artifact quota reached after episode; checkpointed.', flush=True)
@@ -629,7 +637,7 @@ def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
             atomic_json(run_dir / 'state.json', state)
         safe_report(run_dir, state)
         if shutdown.requested:
-            git_progress(state, final=True)
+            git_progress(state, workspace, final=True)
             atomic_json(run_dir / 'state.json', state)
         shutdown.restore()
     return state
