@@ -51,6 +51,41 @@ class FakeModel:
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_eval_manifest_benchmark_outside_training_counts_correctly(self):
+        class HeldOutBenchmark:
+            name = 'cache'
+            def evaluate(self, source, challenge, config):
+                return {'started_at': experiment.now(), 'finished_at': experiment.now(), 'accepted': False,
+                        'build': {'exit_code': 0, 'stdout': '', 'stderr': ''},
+                        'correctness': {'passed': 0, 'total': 1, 'cases': []}, 'performance': {'median_ms': 1},
+                        'reward_inputs': {'solver_reward': 0.0, 'challenger_reward': 1.0}, 'feedback': 'rejected'}
+        class EvalModel:
+            revision = 'test-revision'
+            def generate(self, messages, **kwargs):
+                return {'text': '{"summary":"x","changes":[{"path":"solution.c","content":"int main(void){return 0;}"}]}'}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'repo'; root.mkdir(); subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            (root / 'README').write_text('x')
+            for name in ('cache', 'log', 'search'):
+                path = root / 'docs' / 'benchmarks' / name / 'SPEC.md'; path.parent.mkdir(parents=True, exist_ok=True); path.write_text('spec')
+            env = os.environ | {'GIT_AUTHOR_NAME': 'Test', 'GIT_AUTHOR_EMAIL': 'test@example.com',
+                                'GIT_COMMITTER_NAME': 'Test', 'GIT_COMMITTER_EMAIL': 'test@example.com'}
+            subprocess.run(['git', '-C', str(root), 'add', '.'], check=True); subprocess.run(['git', '-C', str(root), 'commit', '-qm', 'initial'], check=True, env=env)
+            manifest_path = Path(temp) / 'eval.json'
+            judge = {'cpus': 1, 'memory_mb': 256, 'pids': 64, 'tmpfs_mb': 128, 'timeout_seconds': 3, 'output_bytes': 65536}
+            with patch.object(experiment, 'ROOT', root):
+                manifest = experiment.create_eval_manifest(manifest_path, 42, 1, judge)
+                manifest['entries'] = [manifest['entries'][0]]
+                manifest['sha256'] = __import__('hashlib').sha256(json.dumps({key: value for key, value in manifest.items() if key != 'sha256'}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+                experiment.atomic_json(manifest_path, manifest)
+                args = SimpleNamespace(root=Path(temp) / 'runs', run_id='eval_count', seed=42, hours=None, episodes=None,
+                    resume=False, benchmarks='compression', cpus=1, selection_mode='round_robin', memory_mb=256, pids=64,
+                    tmpfs_mb=128, timeout_seconds=3, output_bytes=65536, soft_gb=.1, hard_gb=.2, challenger_tokens=10,
+                    solver_tokens=50, solver_attempts=1, evaluation=True, eval_manifest=manifest_path)
+                with patch.dict(experiment.VALIDATION, {'cache': HeldOutBenchmark}), patch.dict(os.environ, env):
+                    state = experiment.run(args, EvalModel())
+            self.assertEqual(state['selection_counts']['cache'], 1)
+
     def test_prepare_run_serializes_eval_manifest_path(self):
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp) / 'repo'; repo.mkdir(); subprocess.run(['git', 'init', '-q', str(repo)], check=True)

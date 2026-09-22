@@ -261,6 +261,8 @@ def load_eval_manifest(path: Path) -> dict:
     manifest['sha256'] = claimed
     if claimed != actual or not isinstance(manifest.get('entries'), list) or not manifest['entries']:
         raise ValueError('invalid sealed evaluation manifest')
+    if any(entry.get('benchmark') not in VALIDATION for entry in manifest['entries']):
+        raise ValueError('sealed evaluation manifest contains an unknown benchmark')
     _, reference = stable_c_reference()
     if any(entry.get('reference') != reference for entry in manifest['entries']):
         raise ValueError('sealed evaluation C reference differs from references/c-library.md')
@@ -731,7 +733,7 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
                        'challenger_memory': state['challenger_memory'] if getattr(model, 'evaluation', False) else challenger_memory})
     if neural and not model.evaluation: next_state['curriculum'] = curriculum_state(curriculum)
     next_state['selection_counts'] = dict(state['selection_counts'])
-    next_state['selection_counts'][name] += 1
+    next_state['selection_counts'][name] = next_state['selection_counts'].setdefault(name, 0) + 1
     policy_reward = frontier_reward(result['correctness']['passed'] / max(1, result['correctness']['total']))
     if not changed:
         policy_reward = 0.0
@@ -836,6 +838,8 @@ def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
             raise ValueError('evaluation judge settings differ from sealed manifest')
         state['eval_manifest_entries'] = manifest['entries']
         state['eval_solver_attempts'] = manifest['solver_attempts']
+        for entry in manifest['entries']:
+            state['selection_counts'].setdefault(entry['benchmark'], 0)
         state.setdefault('eval_initial_files', {entry['benchmark']: project_files(workspace, entry['benchmark'])
                                                 for entry in manifest['entries']})
         if args.episodes is None or args.episodes > len(manifest['entries']): args.episodes = len(manifest['entries'])
