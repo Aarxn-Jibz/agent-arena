@@ -330,7 +330,7 @@ class RemoteTrainer:
 
     def health(self): return self._request("health", {})
     def generate(self, role, prompt, config):
-        if role not in self.ROLES: raise ValueError("role must be challenger or solver")
+        if role not in self.ROLES + ("base",): raise ValueError("role must be challenger, solver, or base")
         return self._request("generate", {"role": role, "prompt": prompt, "generation_config": config})
     def sample_challenger_action(self, prompt, legal_actions):
         return self._request("sample_challenger_action", {"role": "challenger", "prompt": prompt, "legal_actions": legal_actions})
@@ -474,15 +474,19 @@ class HFPEFTTrainer:
         return compose_context(parts, self.model_config, self)
 
     def generate(self, role: str, prompt: str, config: dict[str, Any]):
-        self.load(); self.set_adapter(role)
+        self.load()
+        if role != "base": self.set_adapter(role)
         d = self._dependencies(); torch = d["torch"]; inputs = self._encode(prompt)
         maximum = int(config.get("max_new_tokens", self.model_config.generation["max_new_tokens"]))
         if inputs["input_ids"].shape[1] + maximum > self.model_config.context_length: raise ValueError("prompt exceeds configured context budget")
         with torch.inference_mode():
-            output = self.model.generate(**inputs, max_new_tokens=maximum, do_sample=config.get("do_sample", True),
+            generate = lambda: self.model.generate(**inputs, max_new_tokens=maximum, do_sample=config.get("do_sample", True),
                 temperature=float(config.get("temperature", self.model_config.generation.get("temperature", .7))),
                 top_p=float(config.get("top_p", self.model_config.generation.get("top_p", .9))),
                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
+            if role == "base":
+                with self.model.disable_adapter(): output = generate()
+            else: output = generate()
         return self.tokenizer.decode(output[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
     def action_log_probability(self, prompt: str, action: dict[str, Any]):

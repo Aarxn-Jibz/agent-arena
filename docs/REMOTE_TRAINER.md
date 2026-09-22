@@ -29,7 +29,7 @@ reference, prompts, and Docker/TinyCC judge as training:
 
 ```bash
 python -m arena experiment --run-id <BASE_RUN> --episodes <N> --evaluation \
-  --trainer-backend remote --trainer-url '<MODAL_URL>' --remote-token-env ARENA_REMOTE_TOKEN
+  --adapter-mode base --trainer-backend remote --trainer-url '<MODAL_URL>' --remote-token-env ARENA_REMOTE_TOKEN
 ```
 
 Start training (the laptop remains authoritative for curriculum, evidence,
@@ -48,6 +48,22 @@ Resume uses the same run ID and the latest named remote checkpoint:
 python -m arena experiment --run-id <RUN_ID> --resume --trainer-backend remote \
   --trainer-url '<MODAL_URL>' --remote-token-env ARENA_REMOTE_TOKEN \
   --hf-repo '<HF_USERNAME>/agent-arena-lora'
+```
+
+For a replaced container, use a full-resume Hub boundary (for example
+`ep-000010`) explicitly:
+
+```bash
+python -m arena experiment --run-id <RUN_ID> --resume --remote-checkpoint ep-000010 \
+  --trainer-backend remote --trainer-url '<MODAL_URL>' --remote-token-env ARENA_REMOTE_TOKEN \
+  --hf-repo '<HF_USERNAME>/agent-arena-lora'
+```
+
+Final trained evaluation keeps adapters enabled:
+
+```bash
+python -m arena experiment --run-id <FINAL_EVAL_RUN> --episodes <N> --evaluation --adapter-mode trained \
+  --trainer-backend remote --trainer-url '<MODAL_URL>' --remote-token-env ARENA_REMOTE_TOKEN
 ```
 
 Run final evaluation with `--evaluation` and the trained checkpoint. The Hub

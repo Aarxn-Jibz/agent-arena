@@ -39,13 +39,14 @@ ROOT = Path(__file__).resolve().parent.parent
 
 class TrainerModel:
     """Small compatibility shim: the existing arena prompt construction speaks Trainer."""
-    def __init__(self, trainer, revision: str | None = None, *, evaluation: bool = False):
+    def __init__(self, trainer, revision: str | None = None, *, evaluation: bool = False, adapter_mode: str = "trained"):
         self.trainer = trainer
         self.revision = revision or getattr(getattr(trainer, "model_config", None), "revision", None) or "configured"
-        self.evaluation = evaluation
+        self.evaluation, self.adapter_mode = evaluation, adapter_mode
         self.prompts = {}
     def generate(self, messages, *, seed, max_new_tokens):
         role = "challenger" if "Challenger" in messages[0]["content"] else "solver"
+        if self.evaluation and self.adapter_mode == "base": role = "base"
         prompt = "\n\n".join(message["content"] for message in messages)
         self.prompts[role] = prompt
         value = self.trainer.generate(role, prompt, {"max_new_tokens": max_new_tokens, "seed": seed})
@@ -659,7 +660,7 @@ def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
             model = offline_model(revision)
         else:
             revision = json.loads((run_dir / 'state.json').read_text())['model_revision'] if args.resume else getattr(args, 'model_revision', None)
-            model = TrainerModel(trainer, revision, evaluation=getattr(args, 'evaluation', False))
+            model = TrainerModel(trainer, revision, evaluation=getattr(args, 'evaluation', False), adapter_mode=getattr(args, 'adapter_mode', 'trained'))
     config = SandboxConfig(cpus=args.cpus, memory_mb=args.memory_mb, pids=args.pids,
                            tmpfs_mb=args.tmpfs_mb, timeout_seconds=args.timeout_seconds,
                            output_bytes=min(args.output_bytes, 1024 * 1024))
@@ -729,6 +730,7 @@ def main(argv=None):
     parser.add_argument('--hf-push-every', type=int, default=5)
     parser.add_argument('--hf-resume-push-every', type=int, default=10)
     parser.add_argument('--evaluation', action='store_true', help='generation-only mode; no trainer updates or checkpoints')
+    parser.add_argument('--adapter-mode', choices=('base', 'trained'), default='trained', help='use disabled adapters for the BASE comparison')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--benchmarks', default=','.join(TRAIN))
     parser.add_argument('--selection-mode', choices=('adaptive', 'round_robin'), default='adaptive')
