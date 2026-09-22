@@ -97,12 +97,18 @@ Reward
 
 ## Not implemented / future work
 
-Explicitly **not** implemented — these are future work, not current behaviour:
+The legacy runner below does not use the new GPU experiment layer.  The
+runtime-ready contracts (curriculum, structured Solver response, feedback,
+checkpointing, mock trainer, and hardware doctor) live in `arena.training`;
+see [GPU handoff](docs/GPU_HANDOFF.md).  Actual HF/PEFT execution remains a
+target-machine dependency.
+
+The legacy runner still does **not** implement:
 
 - Challenger task generation (the current policy only selects existing tasks);
 - LoRA, PPO, GRPO, or any reinforcement-learning weight updates;
 - SmolLM2 policy optimization or Solver/Challenger model co-training;
-- learned curriculum.
+- direct LoRA execution in this CPU-only development environment.
 
 No model weights have been updated; the model runs in inference mode only.
 
