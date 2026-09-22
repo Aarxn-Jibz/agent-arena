@@ -170,19 +170,20 @@ class SolverResponse:
 
 def parse_solver_contract(text: str) -> SolverResponse:
     import re
-    clean = re.sub(r"```(?:[A-Za-z0-9_-]+)?\s*", "", text).replace("```", "").strip()
     def section(name: str) -> str | None:
-        m = re.search(rf"<{name}>\s*(.*?)\s*</{name}>", clean, re.S | re.I)
+        m = re.search(rf"<{name}>\s*(.*?)\s*</{name}>", text, re.S | re.I)
         return m.group(1).strip() if m else None
     strategy, refs, code = section("STRATEGY"), section("REFERENCE_USAGE"), section("CODE")
-    if strategy is None or refs is None or not code: return SolverResponse(strategy or "", [], {}, code or "", "missing required contract section")
-    if refs.upper() == "NONE": return SolverResponse(strategy, [], {}, code)
+    if not code: return SolverResponse(strategy or "", [], {}, "", "missing CODE section")
+    code = re.sub(r"^\s*```(?:c|C)?\s*\n?", "", code)
+    code = re.sub(r"\n?\s*```\s*$", "", code).strip()
+    if not code: return SolverResponse(strategy or "", [], {}, "", "missing CODE section")
+    if not refs or refs.upper() == "NONE": return SolverResponse(strategy or "", [], {}, code + "\n")
     usage = {}; malformed = None
-    for line in refs.splitlines():
-        m = re.match(r"\s*(R\d+)\s*-\s*(.+)", line, re.I)
-        if not m: malformed = "invalid reference usage"; continue
-        usage[m.group(1).upper()] = m.group(2).strip()
-    return SolverResponse(strategy, list(usage), usage, code + "\n", malformed)
+    for match in re.finditer(r"\b(R\d+)\b(?:\s*-\s*([^\n,;/]*))?", refs, re.I):
+        usage[match.group(1).upper()] = (match.group(2) or "").strip()
+    if not usage: malformed = "invalid reference usage"
+    return SolverResponse(strategy or "", list(usage), usage, code + "\n", malformed)
 
 
 def reference_sections(text: str) -> dict[str, str]:

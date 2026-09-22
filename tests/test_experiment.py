@@ -44,10 +44,10 @@ class FakeModel:
         self.calls += 1
         if 'Challenger' in messages[0]['content']:
             data = {'challenge': {'seed': seed, 'size': 1}, 'rationale': 'probe correctness'}
+            return {'text': json.dumps(data), 'tokens': 30, 'truncated': False, 'prompt_tokens': 100}
         else:
             code = 'int main(void){return 0;} /* version2 */' if seed > 501000 else 'int main(void){return 0;}'
-            data = {'summary': 'small candidate', 'changes': [{'path': 'solution.c', 'content': code}]}
-        return {'text': json.dumps(data), 'tokens': 30, 'truncated': False, 'prompt_tokens': 100}
+            return {'text': f'<STRATEGY>small candidate</STRATEGY><REFERENCE_USAGE>NONE</REFERENCE_USAGE><CODE>{code}</CODE>', 'tokens': 30, 'truncated': False, 'prompt_tokens': 100}
 
 
 class ExperimentTests(unittest.TestCase):
@@ -62,6 +62,7 @@ class ExperimentTests(unittest.TestCase):
         class EvalModel:
             revision = 'test-revision'
             def generate(self, messages, **kwargs):
+                return {'text': '<CODE>int main(void){return 0;}</CODE>'}
                 return {'text': '{"summary":"x","changes":[{"path":"solution.c","content":"int main(void){return 0;}"}]}'}
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / 'repo'; root.mkdir(); subprocess.run(['git', 'init', '-q', str(root)], check=True)
@@ -142,6 +143,7 @@ class ExperimentTests(unittest.TestCase):
             def __init__(self): self.prompts = []
             def generate(self, role, prompt, config):
                 self.prompts.append((role, prompt))
+                return {'text': '<CODE>int main(void){return 0;}</CODE>'}
                 return {'text': '{"summary":"x","changes":[{"path":"solution.c","content":"int main(void){return 0;}"}]}'}
         with tempfile.TemporaryDirectory() as temp:
             manifest = experiment.create_eval_manifest(Path(temp) / 'eval.json', 42, 3,
@@ -174,6 +176,7 @@ class ExperimentTests(unittest.TestCase):
             def generate(self, role, prompt, config):
                 self.calls += 1
                 code = 'int main(void){return 1;} /* bad */' if self.calls == 1 else 'int main(void){return 0;} /* good */'
+                return {'text': f'<STRATEGY>repair</STRATEGY><CODE>{code}</CODE>', 'tokens': 9}
                 return {'text': json.dumps({'summary': 'repair', 'changes': [{'path': 'solution.c', 'content': code}]}), 'tokens': 9}
             def update_challenger(self, value): self.updates.append(('challenger', value)); return {'updated': True}
             def update_solver(self, value): self.updates.append(('solver', value)); return {'updated': True}
@@ -203,6 +206,8 @@ class ExperimentTests(unittest.TestCase):
                 super().__init__(['{"challenge":{"seed":1014,"size":1},"rationale":"r"}',
                                   '{"summary":"s","changes":[{"path":"solution.c","content":"int main(void){return 0;}"}]}'])
                 self.saved = []; self.loaded = []
+                self.replies = ['{"challenge":{"seed":1014,"size":1},"rationale":"r"}',
+                                '<STRATEGY>s</STRATEGY><CODE>int main(void){return 0;}</CODE>']
             def save_checkpoint(self, path): self.saved.append(str(path)); return path
             def load_checkpoint(self, path): self.loaded.append(str(path)); return {"restored": True}
         with tempfile.TemporaryDirectory() as temp:

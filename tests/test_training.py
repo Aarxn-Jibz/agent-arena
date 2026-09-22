@@ -89,6 +89,15 @@ class TrainingArchitectureTests(unittest.TestCase):
         self.assertIsNotNone(parse_solver_contract("```c\nint main(){}\n```").malformed)
         self.assertEqual(reference_identity("one\n\ntwo", "v1")["section_ids"], ["R1", "R2"])
 
+    def test_solver_contract_tolerates_tags_fences_and_prose(self):
+        fenced = parse_solver_contract("<STRATEGY>short</STRATEGY><REFERENCE_USAGE>R1/R2</REFERENCE_USAGE><CODE>```c\nint main(void){return 0;}\n```</CODE>")
+        prose = parse_solver_contract("note\n<CODE>int main(void){return 0;}</CODE>\ndone")
+        legacy = parse_solver_contract('{"summary":"x","changes":[]}')
+        self.assertEqual(fenced.reference_ids, ["R1", "R2"])
+        self.assertEqual(fenced.code, "int main(void){return 0;}\n")
+        self.assertEqual(prose.strategy, ""); self.assertIn("int main", prose.code)
+        self.assertEqual(legacy.malformed, "missing CODE section")
+
     def test_resource_feedback_and_large_logs(self):
         self.assertEqual(normalize_resource_status(None)["status"], "unknown")
         self.assertEqual(normalize_resource_status("within limits")["status"], "within limits")

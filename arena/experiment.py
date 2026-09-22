@@ -27,12 +27,12 @@ from .graph_benchmark import GraphBenchmark
 from .http_benchmark import HttpBenchmark
 from .secondary import CacheBenchmark, LogBenchmark, SearchBenchmark
 from .evidence import viewer_events, write_episode
-from .experiment_context import apply_changes, parse_object, parse_solver_response, selected_context, source_diff
+from .experiment_context import parse_object, selected_context, source_diff
 from .sandbox import SandboxConfig
 from .marl import choose_action, init_q, q_update, rolling_average, skill_state, challenger_reward as frontier_reward
 from .training import (PRODUCTION_MODEL, BenchmarkProgress, Curriculum, HFPEFTTrainer, MockTrainer,
                        ModelConfig, RemoteTrainer, RemoteTrainerConfig, SolverResponse, failure_feedback,
-                       reference_identity, verified_correction, challenger_reward as curriculum_reward)
+                       parse_solver_contract, reference_identity, verified_correction, challenger_reward as curriculum_reward)
 
 TRAIN = {'compression': CompressionBenchmark, 'csv': CsvBenchmark, 'http': HttpBenchmark,
          'expression': ExpressionBenchmark, 'graph': GraphBenchmark}
@@ -559,43 +559,27 @@ def solve(model, public_spec: str, challenge: dict, files: dict[str, str], memor
           latest_diff: str, failures: str, seed: int, max_tokens: int, reference: str = ''):
     context, reads = selected_context(files, challenge, latest_diff, failures, ROOT / 'references')
     system = ('You are a C programmer. Produce candidate source for TinyCC. '
-              'No external libraries or network. Choose your own implementation.')
+              'No external libraries or network. Output only the required tagged contract.')
     user = (f'Public specification:\n{public_spec[:5500]}\n'
             f'Accepted source context:\n{context}\n'
             f'Previous Judge feedback: {failures[:800]}\n'
             f'C reference:\n{reference[:6000]}\n'
             f'Your last five notes (may be wrong): {json.dumps(memory[-5:])[:1000]}\n\n'
             f'Now solve this validated challenge: {json.dumps(challenge)}\n'
-            'Reply with changed files as JSON: {"summary":"short decision",'
-            '"changes":[{"path":"solution.c","content":"complete C source"}]}. '
-            'If JSON escaping is difficult, reply with just one ```c fenced solution.c instead. '
-            'Do not discuss the specification.')
+            'Reply exactly as:\n<STRATEGY>one concise sentence</STRATEGY>\n'
+            '<REFERENCE_USAGE>R1/R2 or NONE</REFERENCE_USAGE>\n<CODE>\n'
+            'one complete C program\n</CODE>\n'
+            'Output ONE complete C program, be concise, and stop immediately after </CODE>.')
     messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
     generated = model.generate(messages, seed=seed, max_new_tokens=max_tokens)
     text = generated['text']
-    try:
-        parsed = parse_solver_response(text)
-    except ValueError as first_error:
-        if generated['truncated']:
-            try:
-                continuation = model.generate(messages + [{'role': 'assistant', 'content': text},
-                                                          {'role': 'user', 'content': 'Continue the same JSON response only.'}],
-                                              seed=seed + 1, max_new_tokens=min(max_tokens, 1000))
-                text += continuation['text']
-                generated['continuation_tokens'] = continuation['tokens']
-            except ValueError as err:
-                generated['continuation_error'] = str(err)
-        try:
-            parsed = parse_solver_response(text)
-        except ValueError:
-            generated['error'] = str(first_error)
-            return files, [], '', text, reads, generated
-    try:
-        updated, changed = apply_changes(files, parsed)
-    except (ValueError, KeyError, TypeError) as err:
-        generated['error'] = str(err)
+    parsed = parse_solver_contract(text)
+    if parsed.malformed:
+        generated['error'] = parsed.malformed
         return files, [], '', text, reads, generated
-    return updated, changed, memory_note(parsed.get('summary', ''), 500), text, reads, generated
+    updated = dict(files); updated['solution.c'] = parsed.code
+    changed = ['solution.c'] if files.get('solution.c') != parsed.code else []
+    return updated, changed, memory_note(parsed.strategy, 500), text, reads, generated
 
 
 def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxConfig,
