@@ -23,6 +23,7 @@ from .evidence import viewer_events, write_episode
 from .experiment_context import apply_changes, parse_object, parse_solver_response, selected_context, source_diff
 from .sandbox import SandboxConfig
 from .marl import choose_action, init_q, q_update, rolling_average, skill_state, challenger_reward as frontier_reward
+from .training import PRODUCTION_MODEL
 
 TRAIN = {'compression': CompressionBenchmark, 'csv': CsvBenchmark, 'http': HttpBenchmark,
          'expression': ExpressionBenchmark, 'graph': GraphBenchmark}
@@ -241,7 +242,7 @@ def prepare_run(run_dir: Path, run_id: str, seed: int, model_revision: str, hour
     policy_rng = random.Random(seed)
     state = {'run_id': run_id, 'seed': seed, 'episode': 0, 'started_at': now(),
              'deadline': started + hours * 3600 if hours else None,
-             'benchmarks': benchmarks, 'model_id': 'HuggingFaceTB/SmolLM2-360M-Instruct',
+             'benchmarks': benchmarks, 'model_id': PRODUCTION_MODEL,
              'model_revision': model_revision, 'config': config, 'branch': branch,
              'accepted_head': head, 'base_head': head,
              'challenger_memory': [], 'solver_memory': [],

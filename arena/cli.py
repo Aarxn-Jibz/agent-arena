@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Evaluate C source against a task using TCC, deterministically.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("doctor", help="Report hardware/runtime readiness; never installs or downloads anything.")
     sub.add_parser("experiment", help="Run the offline Docker-only autonomous experiment.")
     run = sub.add_parser("run", help="Evaluate a C file against a task.")
     run.add_argument("task", type=Path, help="Path to a task JSON file.")
@@ -56,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     solve.add_argument(
         "--model", default=None,
-        help="HuggingFace model id (default: HuggingFaceTB/SmolLM2-360M-Instruct).",
+        help="HuggingFace model id (default: production model configuration).",
     )
     marl = sub.add_parser(
         "marl",
@@ -108,6 +109,10 @@ def main(argv: list[str] | None = None) -> int:
         experiment_main(actual[1:])
         return 0
     args = build_parser().parse_args(argv)
+    if args.command == "doctor":
+        from .training import doctor_report
+        print(json.dumps(doctor_report(), indent=2))
+        return 0
     if args.command == "solve":
         return _cmd_solve(args)
     if args.command == "marl":

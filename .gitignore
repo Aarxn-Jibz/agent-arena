@@ -5,3 +5,12 @@ __pycache__/
 dist/
 build/
 trajectories/
+checkpoints/
+hf-cache/
+.cache/huggingface/
+*.safetensors
+*.pt
+*.bin
+judge-tmp/
+raw-logs/
+local-manifest.json

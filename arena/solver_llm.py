@@ -1,12 +1,15 @@
 """Thin transformers adapter for the Solver LLM.
 
 Imported lazily by the CLI so the deterministic arena never depends on the
-ML stack. The default model is HuggingFaceTB/SmolLM2-360M-Instruct.
+ML stack. The production default is configured, never downloaded implicitly
+by this module's import.
 """
 
 from __future__ import annotations
 
-MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
+from .training import PRODUCTION_MODEL
+
+MODEL_ID = PRODUCTION_MODEL
 
 
 def load_model(model_id: str = MODEL_ID):
