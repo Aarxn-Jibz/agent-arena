@@ -475,20 +475,17 @@ class HFPEFTTrainer:
     def _generation_inputs(self, prompt: str):
         torch = self._dependencies()["torch"]
         if hasattr(self.tokenizer, "apply_chat_template"):
-            kwargs = {"tokenize": True, "add_generation_prompt": True, "return_tensors": "pt"}
-            try: rendered = self.tokenizer.apply_chat_template([{"role": "user", "content": prompt}], return_dict=True, **kwargs)
-            except TypeError: rendered = self.tokenizer.apply_chat_template([{"role": "user", "content": prompt}], **kwargs)
-            encoded = dict(rendered) if isinstance(rendered, dict) else {"input_ids": rendered}
+            rendered = self.tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
+                                                          add_generation_prompt=True)
         else:
-            encoded = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
-        device = next(self.model.parameters()).device
-        result = {}
-        for key, value in encoded.items():
-            if not hasattr(value, "to"):
-                value = torch.tensor(value)
-                if len(value.shape) == 1: value = value.unsqueeze(0)
-            result[key] = value.to(device)
-        return result
+            rendered = prompt
+        encoded = self.tokenizer(rendered, return_tensors="pt", add_special_tokens=False)
+        device = getattr(self.model, "device", next(self.model.parameters()).device)
+        inputs = {key: value.to(device) for key, value in encoded.items() if hasattr(value, "to")}
+        input_ids = inputs.get("input_ids")
+        if not isinstance(input_ids, torch.Tensor):
+            raise TypeError(f"expected tensor input_ids, got {type(input_ids)!r}")
+        return inputs
 
     def count(self, text: str) -> int:
         """Tokenizer-derived count for ``compose_context(..., trainer)``."""
@@ -504,8 +501,9 @@ class HFPEFTTrainer:
         if role != "base": self.set_adapter(role)
         d = self._dependencies(); torch = d["torch"]; inputs = self._generation_inputs(prompt)
         maximum = int(config.get("max_new_tokens", self.model_config.generation["max_new_tokens"]))
-        if inputs["input_ids"].shape[1] + maximum > self.model_config.context_length: raise ValueError("prompt exceeds configured context budget")
-        input_len = inputs["input_ids"].shape[-1]
+        input_ids = inputs["input_ids"]
+        input_len = input_ids.shape[-1]
+        if input_len + maximum > self.model_config.context_length: raise ValueError("prompt exceeds configured context budget")
         tokenizer, start = self.tokenizer, input_len
         class StopAtCode:
             def __call__(self, input_ids, scores, **kwargs):

@@ -11,26 +11,29 @@ from arena.training import (Checkpoints, Curriculum, EpisodeOrchestrator, HFPEFT
 
 
 class TrainingArchitectureTests(unittest.TestCase):
-    def test_chat_template_list_is_tensorized_before_context_check(self):
+    def test_chat_template_text_is_tokenized_before_context_check(self):
         class Tensor:
-            def __init__(self, values): self.values = values
+            def __init__(self, values): self.values, self.device = values, None
             @property
-            def shape(self): return (1, len(self.values)) if getattr(self, 'batched', False) else (len(self.values),)
-            def unsqueeze(self, dim): self.batched = True; return self
+            def shape(self): return (1, len(self.values))
             def to(self, device): self.device = device; return self
         class Tokenizer:
-            def apply_chat_template(self, messages, **kwargs): return [1, 2, 3]
+            def apply_chat_template(self, messages, **kwargs): self.template = (messages, kwargs); return 'rendered chat prompt'
+            def __call__(self, text, **kwargs): self.tokenized = (text, kwargs); return {'input_ids': Tensor([1, 2, 3]), 'attention_mask': Tensor([1, 1, 1])}
         class Parameter: device = 'cpu'
         class Model:
             def parameters(self): return iter([Parameter()])
         class Torch:
-            @staticmethod
-            def tensor(value): return Tensor(value)
+            pass
+        Torch.Tensor = Tensor
         trainer = HFPEFTTrainer(ModelConfig(), dependencies={'torch': Torch()})
         trainer.model, trainer.tokenizer = Model(), Tokenizer()
         inputs = trainer._generation_inputs('prompt')
         self.assertEqual(inputs['input_ids'].shape[1], 3)
         self.assertEqual(inputs['input_ids'].device, 'cpu')
+        self.assertEqual(inputs['attention_mask'].device, 'cpu')
+        self.assertEqual(trainer.tokenizer.tokenized[0], 'rendered chat prompt')
+        self.assertFalse(trainer.tokenizer.template[1]['tokenize'])
 
     def test_generation_uses_chat_continuation_slice_and_code_stop(self):
         class Ids:
@@ -43,7 +46,8 @@ class TrainingArchitectureTests(unittest.TestCase):
                 return self.values[key]
         class Tokenizer:
             pad_token_id = eos_token_id = 0
-            def apply_chat_template(self, messages, **kwargs): self.messages = messages; return Ids([10, 11], True)
+            def apply_chat_template(self, messages, **kwargs): self.messages = messages; return 'rendered'
+            def __call__(self, text, **kwargs): self.tokenized = text; return {'input_ids': Ids([10, 11], True)}
             def decode(self, ids, **kwargs):
                 values = ids.values if isinstance(ids, Ids) else ids
                 return '<CODE>#include <stdio.h>\nint main(void){return 0;}</CODE> trailing' if values == [20, 21, 22] else '<CODE>one complete C program</CODE>'
@@ -57,6 +61,7 @@ class TrainingArchitectureTests(unittest.TestCase):
                 self.stopped = kwargs['stopping_criteria'][0](Ids([10, 11, 20, 21, 22], True), None)
                 return Ids([10, 11, 20, 21, 22], True)
         class Torch:
+            Tensor = Ids
             @staticmethod
             def inference_mode(): return nullcontext()
         trainer = HFPEFTTrainer(ModelConfig(context_length=3000), dependencies={'torch': Torch()})
