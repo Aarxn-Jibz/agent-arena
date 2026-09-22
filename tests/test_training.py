@@ -1,3 +1,4 @@
+import shutil
 import tempfile
 import unittest
 from contextlib import nullcontext
@@ -84,8 +85,14 @@ class TrainingArchitectureTests(unittest.TestCase):
             def named_parameters(self): return self.params.items()
             def add_adapter(self, *x): pass
             def set_adapter(self, name): self.active = name
-            def save_pretrained(self, path, selected_adapters): Path(path).mkdir(parents=True); self.saved.append(selected_adapters[0]); self.saved_paths.append(path)
-            def load_adapter(self, path, adapter_name, is_trainable): self.loaded.append(adapter_name); self.loaded_paths.append(path)
+            def save_pretrained(self, path, selected_adapters):
+                adapter = Path(path) / selected_adapters[0]; adapter.mkdir(parents=True)
+                (adapter / "adapter_config.json").write_text("{}"); (adapter / "adapter_model.safetensors").write_text("weights")
+                self.saved.append(selected_adapters[0]); self.saved_paths.append(path)
+            def load_adapter(self, path, adapter_name, is_trainable):
+                if not (Path(path) / "adapter_config.json").is_file() or not (Path(path) / "adapter_model.safetensors").is_file():
+                    raise AssertionError("adapter artifacts missing")
+                self.loaded.append(adapter_name); self.loaded_paths.append(path)
         class Tokenizer:
             @staticmethod
             def from_pretrained(*args, **kwargs): return Tokenizer()
@@ -116,9 +123,23 @@ class TrainingArchitectureTests(unittest.TestCase):
         trainer.update_solver([{"input": {}, "target": {}}]); trainer.update_challenger({"valid": True, "log_probability": 1, "reward": 1})
         self.assertEqual(calls, ["solver", "challenger"])
         with tempfile.TemporaryDirectory() as d:
-            trainer.save_checkpoint(Path(d)); trainer.load_checkpoint(Path(d))
+            checkpoint = Path(d) / "new"; trainer.save_checkpoint(checkpoint); trainer.load_checkpoint(checkpoint)
             self.assertEqual(trainer.model.saved, ["challenger", "solver"]); self.assertEqual(trainer.model.loaded, ["challenger", "solver"])
             self.assertTrue(all(isinstance(path, str) for path in trainer.model.saved_paths + trainer.model.loaded_paths))
+            self.assertTrue(all(Path(path).parent == checkpoint for path in trainer.model.loaded_paths))
+            legacy = Path(d) / "legacy"; shutil.copytree(checkpoint, legacy)
+            for role in trainer.ROLES:
+                adapter = legacy / role; nested = adapter / role; nested.mkdir()
+                for item in list(adapter.iterdir()):
+                    if item != nested: item.rename(nested / item.name)
+            trainer.model.loaded = []; trainer.model.loaded_paths = []; trainer.load_checkpoint(legacy)
+            self.assertEqual(trainer.model.loaded, ["challenger", "solver"])
+            self.assertTrue(all(Path(path).parent.parent == legacy for path in trainer.model.loaded_paths))
+
+    def test_local_adapter_path_rejects_missing_artifacts(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaisesRegex(RuntimeError, "local solver adapter checkpoint is incomplete"):
+                HFPEFTTrainer._local_adapter_path(Path(d), "solver")
 
     def test_hf_backend_missing_libraries_fails_without_download(self):
         with self.assertRaisesRegex(RuntimeError, "HF/PEFT runtime requires"):

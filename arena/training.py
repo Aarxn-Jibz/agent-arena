@@ -591,7 +591,7 @@ class HFPEFTTrainer:
     def save_checkpoint(self, path: Path):
         self.load(); path = Path(path); path.mkdir(parents=True, exist_ok=True); torch = self._dependencies()["torch"]
         for role in self.ROLES:
-            self.model.save_pretrained(str(path / role), selected_adapters=[role])
+            self.model.save_pretrained(str(path), selected_adapters=[role])
             torch.save(self.optimizers[role].state_dict(), path / f"{role}-optimizer.pt")
         (path / "trainer.json").write_text(json.dumps({"steps": self.steps, "baseline": self.baseline, "model": asdict(self.model_config)}))
         if hasattr(torch, "get_rng_state"):
@@ -601,10 +601,21 @@ class HFPEFTTrainer:
             torch.save(rng, path / "rng.pt")
         return path
 
+    @staticmethod
+    def _local_adapter_path(path: Path, role: str) -> Path:
+        candidates = (path / role, path / role / role)
+        for candidate in candidates:
+            if (candidate / "adapter_config.json").is_file() and any((candidate / name).is_file()
+                    for name in ("adapter_model.safetensors", "adapter_model.bin")):
+                return candidate
+        contents = {str(candidate): sorted(item.name for item in candidate.iterdir()) if candidate.is_dir() else []
+                    for candidate in candidates}
+        raise RuntimeError(f"local {role} adapter checkpoint is incomplete; inspected {contents}")
+
     def load_checkpoint(self, path: Path):
         self.load(); path = Path(path); torch = self._dependencies()["torch"]
         for role in self.ROLES:
-            self.model.load_adapter(str(path / role), adapter_name=role, is_trainable=True)
+            self.model.load_adapter(str(self._local_adapter_path(path, role)), adapter_name=role, is_trainable=True)
             self.optimizers[role].load_state_dict(torch.load(path / f"{role}-optimizer.pt", map_location="cpu", weights_only=True))
         saved = json.loads((path / "trainer.json").read_text()); self.steps = saved["steps"]; self.baseline = saved["baseline"]
         rng_path = path / "rng.pt"
