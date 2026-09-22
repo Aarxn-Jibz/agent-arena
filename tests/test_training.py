@@ -79,13 +79,13 @@ class TrainingArchitectureTests(unittest.TestCase):
             def numel(self): return self.n
         class Model:
             def __init__(self):
-                self.params = {"base.weight": Param(100), "x.challenger.lora": Param(3), "x.solver.lora": Param(5)}; self.saved = []; self.loaded = []
+                self.params = {"base.weight": Param(100), "x.challenger.lora": Param(3), "x.solver.lora": Param(5)}; self.saved = []; self.loaded = []; self.saved_paths = []; self.loaded_paths = []
             def parameters(self): return self.params.values()
             def named_parameters(self): return self.params.items()
             def add_adapter(self, *x): pass
             def set_adapter(self, name): self.active = name
-            def save_pretrained(self, path, selected_adapters): Path(path).mkdir(parents=True); self.saved.append(selected_adapters[0])
-            def load_adapter(self, path, adapter_name, is_trainable): self.loaded.append(adapter_name)
+            def save_pretrained(self, path, selected_adapters): Path(path).mkdir(parents=True); self.saved.append(selected_adapters[0]); self.saved_paths.append(path)
+            def load_adapter(self, path, adapter_name, is_trainable): self.loaded.append(adapter_name); self.loaded_paths.append(path)
         class Tokenizer:
             @staticmethod
             def from_pretrained(*args, **kwargs): return Tokenizer()
@@ -118,6 +118,7 @@ class TrainingArchitectureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             trainer.save_checkpoint(Path(d)); trainer.load_checkpoint(Path(d))
             self.assertEqual(trainer.model.saved, ["challenger", "solver"]); self.assertEqual(trainer.model.loaded, ["challenger", "solver"])
+            self.assertTrue(all(isinstance(path, str) for path in trainer.model.saved_paths + trainer.model.loaded_paths))
 
     def test_hf_backend_missing_libraries_fails_without_download(self):
         with self.assertRaisesRegex(RuntimeError, "HF/PEFT runtime requires"):
