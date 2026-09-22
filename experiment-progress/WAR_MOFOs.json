@@ -1,6 +1,6 @@
 {
   "run_id": "WAR_MOFOs",
-  "episode": 5,
+  "episode": 10,
   "started_at": "2026-09-22T19:29:48.600209+00:00",
   "benchmarks": [
     "compression",
@@ -12,11 +12,11 @@
   "model_id": "HuggingFaceTB/SmolLM2-1.7B-Instruct-16k",
   "model_revision": "configured",
   "selection_counts": {
-    "compression": 1,
-    "csv": 1,
-    "http": 1,
-    "expression": 1,
-    "graph": 1
+    "compression": 2,
+    "csv": 2,
+    "http": 2,
+    "expression": 2,
+    "graph": 2
   },
   "performance_history": [
     0.0,
@@ -24,7 +24,7 @@
     0.0
   ],
   "git_push_every": 5,
-  "last_git_progress_episode": 0,
-  "last_git_commit_episode": 0,
+  "last_git_progress_episode": 5,
+  "last_git_commit_episode": 5,
   "status": "running"
 }
