@@ -2,6 +2,7 @@ import io
 import json
 import unittest
 import urllib.error
+from unittest.mock import patch
 
 from arena.training import RemoteTrainer, RemoteTrainerConfig, RemoteTrainerError, publish_schedule
 
@@ -21,7 +22,7 @@ class RemoteTrainerTests(unittest.TestCase):
             value = replies.pop(0)
             if isinstance(value, Exception): raise value
             return Response(value)
-        return RemoteTrainer(RemoteTrainerConfig("https://trainer.example", "secret-value", "run-a", revision="abc", retries=1), opener=open_)
+        return RemoteTrainer(RemoteTrainerConfig("https://trainer.example", "secret-value", "run-a", revision="abc"), opener=open_)
 
     def test_generation_auth_and_compact_payload(self):
         trainer = self.make([{"ok": True, "result": {"text": "hello"}}])
@@ -30,15 +31,38 @@ class RemoteTrainerTests(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), "Bearer secret-value")
         body = json.loads(request.data)
         self.assertEqual(body["operation"], "generate"); self.assertEqual(body["prompt"], "prompt")
-        self.assertNotIn("secret-value", request.data.decode()); self.assertEqual(timeout, 120.0)
+        self.assertNotIn("secret-value", request.data.decode()); self.assertEqual(timeout, 600.0)
 
-    def test_updates_are_idempotent_and_timeout_is_bounded(self):
-        trainer = self.make([urllib.error.URLError("down"), {"ok": True, "result": {"updated": True}}])
-        trainer.update_solver([{"episode_id": 7, "input": {}, "target": {}}])
+    def test_timeout_then_success_retries_with_backoff(self):
+        trainer = self.make([TimeoutError(), {"ok": True, "result": {"text": "ok"}}])
+        with patch("arena.training.time.sleep") as sleep:
+            self.assertEqual(trainer.generate("solver", "prompt", {})["text"], "ok")
+        self.assertEqual(len(self.requests), 2)
+        sleep.assert_called_once_with(2)
+
+    def test_two_timeouts_then_success(self):
+        trainer = self.make([TimeoutError(), urllib.error.URLError("down"), {"ok": True, "result": {"text": "ok"}}])
+        with patch("arena.training.time.sleep") as sleep:
+            self.assertEqual(trainer.generate("solver", "prompt", {})["text"], "ok")
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual([call.args for call in sleep.call_args_list], [(2,), (5,)])
+
+    def test_mutable_retry_reuses_update_id(self):
+        trainer = self.make([TimeoutError(), {"ok": True, "result": {"updated": True}}])
+        with patch("arena.training.time.sleep"):
+            trainer.update_solver([{"episode_id": 7, "input": {}, "target": {}}])
         self.assertEqual(len(self.requests), 2)
         bodies = [json.loads(item[0].data) for item in self.requests]
         self.assertEqual(bodies[0]["update_id"], bodies[1]["update_id"])
         self.assertEqual(bodies[0]["update_id"], "run-a:7:update_solver")
+
+    def test_permanent_http_4xx_is_not_retried(self):
+        trainer = self.make([urllib.error.HTTPError("https://x", 400, "bad", {}, io.BytesIO(b'{}'))])
+        with patch("arena.training.time.sleep") as sleep:
+            with self.assertRaises(RemoteTrainerError) as caught: trainer.update_challenger({"episode_id": 2})
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(len(self.requests), 1)
+        sleep.assert_not_called()
 
     def test_cross_run_checkpoint_restore_keeps_current_run_id(self):
         trainer = self.make([{"ok": True, "result": {"restored": True}}])

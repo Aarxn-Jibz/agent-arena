@@ -295,8 +295,8 @@ class RemoteTrainerConfig:
     run_id: str
     model_id: str = PRODUCTION_MODEL
     revision: str | None = None
-    timeout: float = 120.0
-    retries: int = 2
+    timeout: float = 600.0
+    retries: int = 3
     hf_repo: str | None = None
     hf_push_every: int = 5
     hf_resume_push_every: int = 10
@@ -337,7 +337,7 @@ class RemoteTrainer:
             except (urllib.error.URLError, TimeoutError) as err:
                 last = err
                 if attempt == self.config.retries: break
-                time.sleep(min(.25 * (2 ** attempt), 1.0))
+                time.sleep((2, 5, 10)[min(attempt, 2)])
         raise RemoteTrainerError("timeout" if isinstance(last, TimeoutError) else "connection", "remote trainer unavailable") from last
 
     def health(self): return self._request("health", {})
