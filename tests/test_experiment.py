@@ -80,6 +80,31 @@ class ExperimentTests(unittest.TestCase):
             altered['entries'][0]['challenge']['seed'] += 1
             path.write_text(json.dumps(altered))
             with self.assertRaises(ValueError): experiment.load_eval_manifest(path)
+            reference_path = Path(temp) / 'reference.json'
+            experiment.create_eval_manifest(reference_path, 42, 3, judge)
+            with patch.object(experiment, 'stable_c_reference', return_value=('changed', {'version': 'changed'})):
+                with self.assertRaises(ValueError): experiment.load_eval_manifest(reference_path)
+
+    def test_base_final_initial_prompts_match_for_every_sealed_entry(self):
+        class CaptureTrainer:
+            def __init__(self): self.prompts = []
+            def generate(self, role, prompt, config):
+                self.prompts.append((role, prompt))
+                return {'text': '{"summary":"x","changes":[{"path":"solution.c","content":"int main(void){return 0;}"}]}'}
+        with tempfile.TemporaryDirectory() as temp:
+            manifest = experiment.create_eval_manifest(Path(temp) / 'eval.json', 42, 3,
+                {'cpus': 1, 'memory_mb': 256, 'pids': 64, 'tmpfs_mb': 128, 'timeout_seconds': 3, 'output_bytes': 65536})
+            base, final = CaptureTrainer(), CaptureTrainer()
+            base_model = experiment.TrainerModel(base, evaluation=True, adapter_mode='base')
+            final_model = experiment.TrainerModel(final, evaluation=True, adapter_mode='trained')
+            reference, _ = experiment.stable_c_reference()
+            for entry in manifest['entries']:
+                spec = (experiment.ROOT / 'docs' / 'benchmarks' / entry['benchmark'] / 'SPEC.md').read_text()
+                for model in (base_model, final_model):
+                    experiment.solve(model, spec, entry['challenge'], {}, [], '', '', entry['seeds']['solver_model'], 50, reference)
+            self.assertEqual([prompt for _, prompt in base.prompts], [prompt for _, prompt in final.prompts])
+            self.assertEqual([role for role, _ in base.prompts], ['base'] * 3)
+            self.assertEqual([role for role, _ in final.prompts], ['solver'] * 3)
 
     def test_neural_repair_updates_only_verified_improvement(self):
         class RepairBenchmark(FakeBenchmark):

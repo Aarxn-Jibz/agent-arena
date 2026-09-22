@@ -40,6 +40,13 @@ class RemoteTrainerTests(unittest.TestCase):
         self.assertEqual(bodies[0]["update_id"], bodies[1]["update_id"])
         self.assertEqual(bodies[0]["update_id"], "run-a:7:update_solver")
 
+    def test_cross_run_checkpoint_restore_keeps_current_run_id(self):
+        trainer = self.make([{"ok": True, "result": {"restored": True}}])
+        trainer.load_checkpoint("latest", "WAR_MOFOs")
+        body = json.loads(self.requests[0][0].data)
+        self.assertEqual(body["run_id"], "run-a")
+        self.assertEqual(body["source_run_id"], "WAR_MOFOs")
+
     def test_remote_errors_are_structured(self):
         trainer = self.make([urllib.error.HTTPError("https://x", 409, "conflict", {}, io.BytesIO(b'{"error":"run_mismatch"}'))])
         with self.assertRaises(RemoteTrainerError) as caught: trainer.update_challenger({"episode_id": 2})

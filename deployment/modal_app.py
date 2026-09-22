@@ -48,18 +48,18 @@ class ArenaTrainerService:
             _error("model_mismatch", "model ID or revision differs from loaded service", 409)
         self.run_id = run_id
 
-    def _checkpoint_dir(self, checkpoint_id):
+    def _checkpoint_dir(self, checkpoint_id, run_id=None):
         safe = hashlib.sha256(str(checkpoint_id).encode()).hexdigest()[:16]
-        return Path("/checkpoints") / self.run_id / safe
+        return Path("/checkpoints") / (run_id or self.run_id) / safe
 
-    def _restore_from_hub(self, path, checkpoint_id, hf):
+    def _restore_from_hub(self, path, checkpoint_id, hf, source_run_id):
         """Fetch only a named sparse bundle after a replaced container."""
         if not hf or not hf.get("repo"): _error("checkpoint_missing", "checkpoint is not local and no HF repo was supplied", 404)
         from huggingface_hub import snapshot_download
         name = "final" if checkpoint_id == "final" else checkpoint_id
-        pattern = f"runs/{self.run_id}/{name}/**"
+        pattern = f"runs/{source_run_id}/{name}/**"
         downloaded = Path(snapshot_download(repo_id=hf["repo"], repo_type="model", token=os.environ.get("HF_TOKEN"), allow_patterns=[pattern]))
-        source = downloaded / "runs" / self.run_id / name
+        source = downloaded / "runs" / source_run_id / name
         if not source.exists(): _error("checkpoint_missing", "named checkpoint was not found in HF", 404)
         shutil.copytree(source, path, dirs_exist_ok=True)
 
@@ -111,10 +111,13 @@ class ArenaTrainerService:
             hf = request.get("hf", {}); due = publish_schedule(episode, int(hf.get("push_every", 5)), int(hf.get("resume_push_every", 10)))["adapters"]
             return {"ok": True, "result": {"checkpoint": str(path), **(self._publish(path, episode, hf) if due else {"published": False})}}
         if op == "load_checkpoint":
-            checkpoint_id = request.get("checkpoint_id", "latest"); path = self._checkpoint_dir(checkpoint_id)
-            if not path.exists(): self._restore_from_hub(path, checkpoint_id, request.get("hf", {}))
+            checkpoint_id = request.get("checkpoint_id", "latest")
+            source_run_id = request.get("source_run_id", self.run_id)
+            if not isinstance(source_run_id, str) or not source_run_id: _error("invalid_request", "source_run_id must be a non-empty string")
+            path = self._checkpoint_dir(checkpoint_id, source_run_id)
+            if not path.exists(): self._restore_from_hub(path, checkpoint_id, request.get("hf", {}), source_run_id)
             manifest = json.loads((path / "checkpoint_manifest.json").read_text())
-            if manifest["run_id"] != self.run_id: _error("run_mismatch", "checkpoint belongs to another run", 409)
+            if manifest["run_id"] != source_run_id: _error("run_mismatch", "checkpoint belongs to source run", 409)
             self.trainer.load_checkpoint(path); self.completed = {key: {"updated": True} for key in manifest.get("completed_update_ids", [])}; self.checkpoint = str(path)
             return {"ok": True, "result": {"restored": True, "checkpoint": str(path)}}
         if op == "adapter_state": return {"ok": True, "result": self.trainer.adapter_state(request.get("role"))}

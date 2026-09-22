@@ -344,7 +344,10 @@ class RemoteTrainer:
         return self._update("update_solver", {"role": "solver", "correction_examples": examples}, episode_id)
     def update_challenger(self, experience): return self._update("update_challenger", {"role": "challenger", "experience": experience})
     def save_checkpoint(self, path): return self._request("save_checkpoint", {"checkpoint_id": str(path), "episode_id": self._episode})
-    def load_checkpoint(self, path): return self._request("load_checkpoint", {"checkpoint_id": str(path)})
+    def load_checkpoint(self, path, source_run_id=None):
+        body = {"checkpoint_id": str(path)}
+        if source_run_id: body["source_run_id"] = source_run_id
+        return self._request("load_checkpoint", body)
     def adapter_state(self, role): return self._request("adapter_state", {"role": role})
     def shutdown(self): return self._request("shutdown", {})
     def finalize(self): return self._request("finalize", {"episode_id": self._episode})

@@ -38,6 +38,7 @@ TRAIN = {'compression': CompressionBenchmark, 'csv': CsvBenchmark, 'http': HttpB
          'expression': ExpressionBenchmark, 'graph': GraphBenchmark}
 VALIDATION = {'cache': CacheBenchmark, 'log': LogBenchmark, 'search': SearchBenchmark}
 ROOT = Path(__file__).resolve().parent.parent
+REFERENCE_ROOT = ROOT / 'references'
 
 
 class TrainerModel:
@@ -219,10 +220,15 @@ def challenge_from_action(benchmark, action: dict, seed: int) -> dict:
     return challenge
 
 
+def stable_c_reference() -> tuple[str, dict]:
+    text = (REFERENCE_ROOT / 'c-library.md').read_text()
+    return text, reference_identity(text, 'references/c-library.md')
+
+
 def create_eval_manifest(path: Path, seed: int, solver_attempts: int, judge: dict) -> dict:
     """Seal the held-out cache/log/search inputs before either comparison."""
     entries = []
-    reference = (ROOT / 'references' / 'c-library.md').read_text()
+    reference, reference_meta = stable_c_reference()
     for index, name in enumerate(('cache', 'log', 'search'), 1):
         challenge_seed = (seed + index * 1009) % (2**32)
         benchmark = VALIDATION[name]()
@@ -232,7 +238,7 @@ def create_eval_manifest(path: Path, seed: int, solver_attempts: int, judge: dic
         spec = (ROOT / 'docs' / 'benchmarks' / name / 'SPEC.md').read_text()
         entries.append({'benchmark': name, 'challenge': challenge,
                         'seeds': {'challenge': challenge_seed, 'solver_model': challenge_seed + 500000},
-                        'reference': reference_identity(reference, 'references/c-library.md'),
+                        'reference': reference_meta,
                         'spec_sha256': hashlib.sha256(spec.encode()).hexdigest()})
     manifest = {'version': 1, 'entries': entries, 'solver_attempts': solver_attempts,
                 'protocol': 'experiment-solver-json-v1', 'judge': judge}
@@ -248,6 +254,9 @@ def load_eval_manifest(path: Path) -> dict:
     manifest['sha256'] = claimed
     if claimed != actual or not isinstance(manifest.get('entries'), list) or not manifest['entries']:
         raise ValueError('invalid sealed evaluation manifest')
+    _, reference = stable_c_reference()
+    if any(entry.get('reference') != reference for entry in manifest['entries']):
+        raise ValueError('sealed evaluation C reference differs from references/c-library.md')
     return manifest
 
 
@@ -615,19 +624,20 @@ def episode(model, state: dict, workspace: Path, run_dir: Path, config: SandboxC
     atomic_json(run_dir / 'pending.json', {'ready': False, 'episode_id': number,
                                            'challenge': challenge, 'rationale': rationale,
                                            'challenger_generation': challenger_gen})
-    before = project_files(workspace, name)
-    latest_diff = git('show', '--format=', '--', f'solutions/{name}', cwd=workspace)[:1500]
-    failures = '\n'.join(x['feedback'] for x in recent if x['outcome'] == 'rejected')
+    before = (dict(state['eval_initial_files'][name]) if eval_entry else project_files(workspace, name))
+    latest_diff = '' if eval_entry else git('show', '--format=', '--', f'solutions/{name}', cwd=workspace)[:1500]
+    failures = '' if eval_entry else '\n'.join(x['feedback'] for x in recent if x['outcome'] == 'rejected')
     attempts, attempt_evidence = [], []
-    reference_text = before.get('solution.c', '')
-    reference = reference_identity(reference_text, 'accepted-source')
+    reference_text, reference = stable_c_reference()
+    if eval_entry and eval_entry['reference'] != reference:
+        raise ValueError('sealed evaluation C reference changed during run')
     candidate, changed, summary, response, reads, solver_gen = before, [], '', '', [], {}
     result = synthetic_failure(benchmark, challenge, 'Solver made no attempt')
     feedback = failures
     for attempt_number in range(1, max(1, solver_attempts) + 1):
         try:
             candidate, changed, summary, response, reads, solver_gen = solve(
-                model, spec, challenge, before, state['solver_memory'], latest_diff, feedback,
+                model, spec, challenge, before, [] if eval_entry else state['solver_memory'], latest_diff, feedback,
                 seed + 500000 + attempt_number - 1, solver_tokens, reference_text)
             result = (synthetic_failure(benchmark, challenge, 'Invalid Solver response: ' + solver_gen['error'])
                       if solver_gen.get('error') else judge_candidate(benchmark, candidate, challenge, config))
@@ -818,10 +828,17 @@ def _run_locked(args, model=None, shutdown: ShutdownController | None = None):
             raise ValueError('evaluation judge settings differ from sealed manifest')
         state['eval_manifest_entries'] = manifest['entries']
         state['eval_solver_attempts'] = manifest['solver_attempts']
+        state.setdefault('eval_initial_files', {entry['benchmark']: project_files(workspace, entry['benchmark'])
+                                                for entry in manifest['entries']})
         if args.episodes is None or args.episodes > len(manifest['entries']): args.episodes = len(manifest['entries'])
     state = reconcile(run_dir, state, workspace)
     if isinstance(model, TrainerModel) and (args.resume or getattr(args, 'remote_checkpoint', None)):
-        model.trainer.load_checkpoint(getattr(args, 'remote_checkpoint', None) or "latest")
+        checkpoint = getattr(args, 'remote_checkpoint', None) or "latest"
+        source_run_id = getattr(args, 'remote_checkpoint_run_id', None)
+        if source_run_id:
+            model.trainer.load_checkpoint(checkpoint, source_run_id)
+        else:
+            model.trainer.load_checkpoint(checkpoint)
     shutdown = shutdown or ShutdownController()
     shutdown.install()
     soft, hard = int(args.soft_gb * 1024**3), int(args.hard_gb * 1024**3)
@@ -878,6 +895,7 @@ def main(argv=None):
     parser.add_argument('--remote-timeout', type=float, default=120.0)
     parser.add_argument('--remote-retries', type=int, default=2)
     parser.add_argument('--remote-checkpoint', help='named remote/HF checkpoint for recovery after a replaced Modal container')
+    parser.add_argument('--remote-checkpoint-run-id', help='source run ID for a cross-run remote checkpoint restore')
     parser.add_argument('--model-revision')
     parser.add_argument('--hf-repo', help='private Hub repository used by the remote trainer')
     parser.add_argument('--hf-push-every', type=int, default=5)
