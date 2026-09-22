@@ -50,7 +50,7 @@ class TrainingArchitectureTests(unittest.TestCase):
             def __call__(self, text, **kwargs): self.tokenized = text; return {'input_ids': Ids([10, 11], True)}
             def decode(self, ids, **kwargs):
                 values = ids.values if isinstance(ids, Ids) else ids
-                return '<CODE>#include <stdio.h>\nint main(void){return 0;}</CODE> trailing' if values == [20, 21, 22] else '<CODE>one complete C program</CODE>'
+                return '\\<CODE>\n<C>\n#include <stdio.h>\nint main(void){return 0;}\n\\</C> trailing' if values == [20, 21, 22] else '<CODE>one complete C program</CODE>'
         class Parameter: device = 'cpu'
         class Model:
             def parameters(self): return iter([Parameter()])
@@ -70,7 +70,7 @@ class TrainingArchitectureTests(unittest.TestCase):
         self.assertEqual(trainer.tokenizer.messages, [{'role': 'user', 'content': '<CODE>one complete C program</CODE>'}])
         self.assertEqual(trainer.model.kwargs['max_new_tokens'], 2500)
         self.assertTrue(trainer.model.stopped); self.assertEqual(result['tokens'], 3)
-        self.assertEqual(result['text'], '<CODE>#include <stdio.h>\nint main(void){return 0;}</CODE>')
+        self.assertEqual(result['text'], '\\<CODE>\n<C>\n#include <stdio.h>\nint main(void){return 0;}\n\\</C>')
         self.assertNotIn('one complete C program', result['text'])
 
     def test_hf_backend_adapter_isolation_checkpoint_and_offline_load(self):
@@ -162,6 +162,12 @@ class TrainingArchitectureTests(unittest.TestCase):
         self.assertEqual(prose.strategy, ""); self.assertIn("int main", prose.code)
         self.assertEqual(legacy.malformed, "missing CODE section")
         self.assertIn('int main', fallback.code)
+
+    def test_solver_contract_recovers_escaped_nested_c_with_trailing_text(self):
+        reply = r'\<CODE>' + '\n<C>\n#include <stdio.h>\nint main(void){return 1;}\n' + r'\</C>' + '\nrambling'
+        parsed = parse_solver_contract(reply)
+        self.assertFalse(parsed.malformed)
+        self.assertEqual(parsed.code, '#include <stdio.h>\nint main(void){return 1;}\n')
 
     def test_resource_feedback_and_large_logs(self):
         self.assertEqual(normalize_resource_status(None)["status"], "unknown")

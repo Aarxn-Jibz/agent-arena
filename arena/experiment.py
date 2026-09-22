@@ -567,10 +567,8 @@ def solve(model, public_spec: str, challenge: dict, files: dict[str, str], memor
             f'C reference:\n{reference[:6000]}\n'
             f'Your last five notes (may be wrong): {json.dumps(memory[-5:])[:1000]}\n\n'
             f'Now solve this validated challenge: {json.dumps(challenge)}\n'
-            'Reply exactly as:\n<STRATEGY>one concise sentence</STRATEGY>\n'
-            '<REFERENCE_USAGE>R1/R2 or NONE</REFERENCE_USAGE>\n<CODE>\n'
-            'one complete C program\n</CODE>\n'
-            'Output ONE complete C program, be concise, and stop immediately after </CODE>.')
+            'Begin with <CODE>. Output exactly one complete C program. '
+            'End with </CODE>. Output nothing else.')
     messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
     generated = model.generate(messages, seed=seed, max_new_tokens=max_tokens)
     text = generated['text']

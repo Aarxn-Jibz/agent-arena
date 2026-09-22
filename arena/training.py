@@ -171,13 +171,20 @@ class SolverResponse:
 def parse_solver_contract(text: str) -> SolverResponse:
     import re
     def section(name: str) -> str | None:
-        m = re.search(rf"<{name}>\s*(.*?)\s*</{name}>", text, re.S | re.I)
+        m = re.search(rf"\\?<{name}>\s*(.*?)\s*\\?</{name}>", text, re.S | re.I)
         return m.group(1).strip() if m else None
     strategy, refs, code = section("STRATEGY"), section("REFERENCE_USAGE"), section("CODE")
     if not code:
+        opened = re.search(r"\\?<CODE>", text, re.I)
+        c_body = section("C") if opened else None
+        if c_body:
+            return SolverResponse(strategy or "", [], {}, c_body.strip() + "\n")
         blocks = re.findall(r"```c\s*\n(.*?)\n```", text, re.S | re.I)
         if len(blocks) == 1 and re.search(r"\b(?:int\s+main|#include)\b", blocks[0]):
             return SolverResponse(strategy or "", [], {}, blocks[0].strip() + "\n")
+        raw = text.strip()
+        if re.search(r"#include\b", raw) and re.search(r"\bmain\s*\(", raw):
+            return SolverResponse(strategy or "", [], {}, raw + "\n")
         return SolverResponse(strategy or "", [], {}, "", "missing CODE section")
     code = re.sub(r"^\s*```(?:c|C)?\s*\n?", "", code)
     code = re.sub(r"\n?\s*```\s*$", "", code).strip()
@@ -507,7 +514,10 @@ class HFPEFTTrainer:
         tokenizer, start = self.tokenizer, input_len
         class StopAtCode:
             def __call__(self, input_ids, scores, **kwargs):
-                return "</CODE>" in tokenizer.decode(input_ids[0, start:], skip_special_tokens=True)
+                text = tokenizer.decode(input_ids[0, start:], skip_special_tokens=True)
+                if "</CODE>" in text or "\\</CODE>" in text: return True
+                opened = "<CODE>" in text or "\\<CODE>" in text
+                return opened and ("</C>" in text or "\\</C>" in text)
         with torch.inference_mode():
             generate = lambda: self.model.generate(**inputs, max_new_tokens=maximum, do_sample=config.get("do_sample", True),
                 temperature=float(config.get("temperature", self.model_config.generation.get("temperature", .7))),
@@ -518,9 +528,10 @@ class HFPEFTTrainer:
                 with self.model.disable_adapter(): output = generate()
             else: output = generate()
         generated = output[0, input_len:]
-        text = self.tokenizer.decode(generated, skip_special_tokens=True)
-        if "</CODE>" in text: text = text[:text.index("</CODE>") + len("</CODE>")]
-        return {"text": text, "raw_generation": text, "tokens": int(generated.shape[0]), "prompt_tokens": int(input_len)}
+        raw_generation = self.tokenizer.decode(generated, skip_special_tokens=True)
+        endings = [marker for marker in ("</CODE>", "\\</CODE>", "</C>", "\\</C>") if marker in raw_generation]
+        text = raw_generation[:raw_generation.index(min(endings, key=raw_generation.index)) + len(min(endings, key=raw_generation.index))] if endings else raw_generation
+        return {"text": text, "raw_generation": raw_generation, "tokens": int(generated.shape[0]), "prompt_tokens": int(input_len)}
 
     def action_log_probability(self, prompt: str, action: dict[str, Any]):
         """Differentiable log P(action JSON | prompt), retained for REINFORCE."""
